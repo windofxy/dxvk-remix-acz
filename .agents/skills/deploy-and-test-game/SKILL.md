@@ -3,6 +3,10 @@ name: deploy-and-test-game
 description: Deploy built dxvk-remix to a game and launch it. Use when the user asks to deploy, test, run, or debug a game with Remix, or when built changes need to be tested in a running game.
 ---
 
+For the native x64 ACZ D3D12 workflow, read `deploy-acz-remix/SKILL.md` first.
+ACZ loads the adapted `d3d12.dll` beside `acz.exe`; it does not use the normal
+x64 D3D9 `d3d9.dll` shim as its renderer entry point.
+
 # Deploy and Test a Game
 
 All commands run in PowerShell from the repo root unless otherwise noted.

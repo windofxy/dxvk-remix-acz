@@ -1,0 +1,15 @@
+LIBRARY d3d12.dll
+EXPORTS
+  D3D12CreateDevice @101
+  D3D12GetDebugInterface
+  D3D12GetInterface
+  D3D12EnableExperimentalFeatures
+  D3D12SerializeRootSignature
+  D3D12SerializeVersionedRootSignature
+  D3D12CreateRootSignatureDeserializer
+  D3D12CreateVersionedRootSignatureDeserializer
+  remixD3D12RuntimePresent
+  remixD3D12RuntimePresentBegin
+  remixD3D12SetCamera
+  remixD3D12SetOutputEnabled
+  remixD3D12SetWorldSpacePolicy

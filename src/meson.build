@@ -6,6 +6,17 @@ subdir('vulkan')
 subdir('lssusd')
 subdir('dxvk')
 
+if get_option('enable_d3d12')
+  subdir('d3d12')
+endif
+
+if get_option('enable_dxgi_proxy')
+  if get_option('enable_dxgi')
+    error('The ACZ DXGI proxy cannot be built together with the DXVK DXGI frontend.')
+  endif
+  subdir('dxgi_proxy')
+endif
+
 if get_option('enable_dxgi')
   if not get_option('enable_d3d11')
     error('D3D11 is required for DXGI.')

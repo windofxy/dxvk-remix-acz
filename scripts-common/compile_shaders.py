@@ -38,7 +38,10 @@ args = parser.parse_args()
 # Set to True to generate Slang repro file when compiling shaders
 generateSlangRepro = False
 
-includePaths = ' '.join([f'-I{path}' for path in args.includes])
+def quoteArg(value):
+    return '"' + value.replace('"', '\\"') + '"'
+
+includePaths = ' '.join([f'-I{quoteArg(path)}' for path in args.includes])
 slangDll = os.path.join(os.path.dirname(args.slangc), 'slang.dll')
 
 tools = [args.glslang, args.slangc, slangDll, __file__]
@@ -206,8 +209,8 @@ def createGlslangTask(inputFile):
     task = createBasicTask(inputFile, destFile, destFile, depFile)
     variableName = '' if args.binary else f'--vn {shaderName}'
 
-    command = f'{args.glslang} {glslangFlags} {includePaths} -V {variableName} -o {destFile} ' \
-            + f'--depfile {depFile} {inputFile}'
+    command = f'{quoteArg(args.glslang)} {glslangFlags} {includePaths} -V {variableName} -o {quoteArg(destFile)} ' \
+            + f'--depfile {quoteArg(depFile)} {quoteArg(inputFile)}'
     task.commands = [command]
     return task
 
@@ -229,8 +232,8 @@ def createSlangTask(inputFile, variantSpec):
     if variantName != inputName:
         task.customName = f'{os.path.basename(inputFile)} ({variantName})'
 
-    command1 = f'{args.slangc} -entry main -target spirv -zero-initialize -emit-spirv-directly -verbose-paths {includePaths} ' \
-            + f'-depfile {depFile} {inputFile} -D__SLANG__ {variantDefines} ' \
+    command1 = f'{quoteArg(args.slangc)} -entry main -target spirv -zero-initialize -emit-spirv-directly -verbose-paths {includePaths} ' \
+            + f'-depfile {quoteArg(depFile)} {quoteArg(inputFile)} -D__SLANG__ {variantDefines} ' \
             + f'-matrix-layout-column-major ' \
             + f'-Wno-30081 '
 
@@ -245,7 +248,7 @@ def createSlangTask(inputFile, variantSpec):
       reproFile = os.path.join(args.output, variantName + ".slangRepro")
       command1 += f'-dump-repro {reproFile}'
 
-    command1 += f'-o {destFile}'
+    command1 += f'-o {quoteArg(destFile)}'
 
     # -binary switch just writes the SPV binary
     if args.binary:
@@ -257,7 +260,7 @@ def createSlangTask(inputFile, variantSpec):
         # Command to convert SPV into c array header
         script_dir = os.path.dirname(os.path.realpath(__file__))
         shader_xxd = os.path.join(script_dir, 'shader_xxd.py')
-        command2 = f'"{sys.executable}" {shader_xxd} -i {destFile} -o {headerFile}'
+        command2 = f'{quoteArg(sys.executable)} {quoteArg(shader_xxd)} -i {quoteArg(destFile)} -o {quoteArg(headerFile)}'
 
         task.commands = [command1, command2]
 
@@ -491,7 +494,7 @@ def parseShaderVariants(inputFile):
     inputName, inputType = os.path.splitext(inputWithType)
     endvariantsFound = False
     matrix = None
-    with open(inputFile, "r") as file:
+    with open(inputFile, "r", encoding="utf-8") as file:
         for line in file:
             lineno += 1
             if line.startswith("//!variant-matrix"):

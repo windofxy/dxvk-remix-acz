@@ -331,6 +331,8 @@ dxvk_src = files([
   'rtx_render/rtx_reflex.cpp',
   'rtx_render/rtx_reflex.h',
   'rtx_render/rtx_remix_api.cpp',
+  'rtx_render/rtx_native_api.cpp',
+  'rtx_render/rtx_native_api.h',
   'rtx_render/rtx_resources.cpp',
   'rtx_render/rtx_resources.h',
   'rtx_render/rtx_restir_gi_rayquery.cpp',
