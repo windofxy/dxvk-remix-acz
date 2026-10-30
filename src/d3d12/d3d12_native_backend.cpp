@@ -62,6 +62,9 @@ namespace remix {
     uint32_t g_lastCameraFrame = UINT32_MAX;
     dxvk::Matrix4 g_cameraWorldToView;
     dxvk::Matrix4 g_cameraViewToProjection;
+    dxvk::Vector3 g_cameraEye;
+    std::atomic<float> g_nativeNearestInstanceDistanceSq { 3.4e38f };
+    std::atomic<uint32_t> g_nativeNearInstances { 0 };
     bool g_hasCameraMatrices = false;
     bool g_hasPreparedScene = false;
     uint32_t g_preservedSceneFrames = 0;
@@ -77,6 +80,9 @@ namespace remix {
     std::atomic<uint64_t> g_nativeInjectCalls { 0 };
     std::atomic<uint64_t> g_nativeNoTransform { 0 };
     std::atomic<uint64_t> g_nativeIdentityFiltered { 0 };
+    // White model mode: every surface is submitted opaque and self lit, so the
+    // captured geometry is visible without the game's textures. F7 toggles it.
+    std::atomic<uint32_t> g_forceWhiteMaterials { 1 };
     std::atomic<uint64_t> g_nativeReadFailures { 0 };
     std::atomic<uint64_t> g_nativeConversionFailures { 0 };
     std::atomic<uint64_t> g_nativeAcceptedInstances { 0 };
@@ -89,6 +95,7 @@ namespace remix {
     // F10 toggles the Remix output so the native frame can be inspected while
     // capture keeps running.
     bool g_remixOutputKeyDown = false;
+    bool g_whiteMaterialKeyDown = false;
     std::atomic<uint32_t> g_transformRejectionDiagnostics { 0 };
 
     uint64_t perfTicks() {
@@ -648,17 +655,19 @@ namespace remix {
     }
 
     // A row-vector world-to-view matrix keeps three orthonormal rows and stores
-    // the translation in the fourth row.
+    // the translation in its fourth row.
     bool buildWorldToView(const float* view, dxvk::Matrix4& worldToView) {
       if (!finiteCameraMatrix(view))
         return false;
 
       std::array<float, 9> rotation {};
+      std::array<float, 3> rowLengths {};
       for (size_t row = 0; row < 3; ++row) {
         const float* r = view + row * 4;
         const float length = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
         if (std::abs(length - 1.0f) > 0.05f)
           return false;
+        rowLengths[row] = length;
         for (size_t column = 0; column < 3; ++column)
           rotation[row * 3 + column] = r[column] / length;
       }
@@ -672,11 +681,48 @@ namespace remix {
       if (std::abs(dot01) > 0.05f || std::abs(dot02) > 0.05f || std::abs(dot12) > 0.05f)
         return false;
 
+      // Remix takes the camera position from the inverse of this matrix, so the
+      // translation has to be rebuilt from the normalized rows. Keeping the
+      // original one would place the eye at a distance scaled by the row length,
+      // which reads as every camera translation being amplified. For a
+      // row-vector matrix with an orthonormal rotation the eye is recovered by
+      // eye_i = -sum_j t[j] * R[i][j], and the translation is its negation
+      // projected back onto the rows.
+      std::array<float, 3> eye {};
+      for (size_t column = 0; column < 3; ++column) {
+        eye[column] = -(view[12] * rotation[0 * 3 + column]
+          + view[13] * rotation[1 * 3 + column]
+          + view[14] * rotation[2 * 3 + column]);
+      }
+      std::array<float, 3> translation {};
+      for (size_t column = 0; column < 3; ++column) {
+        translation[column] = -(eye[0] * rotation[0 + column]
+          + eye[1] * rotation[3 + column]
+          + eye[2] * rotation[6 + column]);
+      }
+
+      static std::atomic<uint32_t> basisLogs { 0 };
+      if (basisLogs.fetch_add(1, std::memory_order_relaxed) < 6) {
+        log("D3D12 camera world-to-view: rowLengths=(%.6f,%.6f,%.6f) eye=(%.3f,%.3f,%.3f) t=(%.3f,%.3f,%.3f) tBuilt=(%.3f,%.3f,%.3f)",
+          static_cast<double>(rowLengths[0]),
+          static_cast<double>(rowLengths[1]),
+          static_cast<double>(rowLengths[2]),
+          static_cast<double>(eye[0]),
+          static_cast<double>(eye[1]),
+          static_cast<double>(eye[2]),
+          static_cast<double>(view[12]),
+          static_cast<double>(view[13]),
+          static_cast<double>(view[14]),
+          static_cast<double>(translation[0]),
+          static_cast<double>(translation[1]),
+          static_cast<double>(translation[2]));
+      }
+
       worldToView = dxvk::Matrix4(
         rotation[0], rotation[1], rotation[2], 0.0f,
         rotation[3], rotation[4], rotation[5], 0.0f,
         rotation[6], rotation[7], rotation[8], 0.0f,
-        view[12], view[13], view[14], 1.0f);
+        translation[0], translation[1], translation[2], 1.0f);
       return true;
     }
 
@@ -1001,6 +1047,18 @@ namespace remix {
         }
       }
 
+      if (!position && pipelineInfo) {
+        // Model draws name their attributes ATTRIBUTE0..3 rather than POSITION and
+        // keep the position in the first one, so the lowest slot 0 offset stands in
+        // for it. Without this every such vertex collapses to the origin.
+        for (const auto& element : pipelineInfo->inputElements) {
+          if (element.slot != 0 || element.offset == D3D12_APPEND_ALIGNED_ELEMENT)
+            continue;
+          if (!position || element.offset < position->offset)
+            position = &element;
+        }
+      }
+
       if (position) {
         const DXGI_FORMAT format = position->format;
         const bool supported = format == DXGI_FORMAT_R32_FLOAT
@@ -1219,6 +1277,21 @@ namespace remix {
       if (pipelineInfo && pipelineInfo->hasObjectToWorld) {
         const auto& m = pipelineInfo->objectToWorld;
         const uint32_t diagnosticIndex = g_transformDiagnosticCount.fetch_add(1, std::memory_order_relaxed);
+        {
+          // Distance from the camera eye tells whether the object the scene is
+          // framed around is among the submitted instances at all.
+          const float dx = m[12] - g_cameraEye.x;
+          const float dy = m[13] - g_cameraEye.y;
+          const float dz = m[14] - g_cameraEye.z;
+          const float distanceSq = dx * dx + dy * dy + dz * dz;
+          float previous = g_nativeNearestInstanceDistanceSq.load(std::memory_order_relaxed);
+          while (distanceSq < previous
+              && !g_nativeNearestInstanceDistanceSq.compare_exchange_weak(
+                   previous, distanceSq, std::memory_order_relaxed)) {
+          }
+          if (distanceSq < 1.0e6f)
+            g_nativeNearInstances.fetch_add(1, std::memory_order_relaxed);
+        }
         if (diagnosticIndex < 512) {
           const float translationLength = std::sqrt(
             m[12] * m[12] + m[13] * m[13] + m[14] * m[14]);
@@ -1390,25 +1463,38 @@ namespace remix {
             break;
           }
         }
+        const bool forceWhite = g_forceWhiteMaterials.load(std::memory_order_relaxed) != 0;
+        materialKey = XXH64(&forceWhite, sizeof(forceWhite), materialKey);
         materialKey = (materialKey | 0x1000ull);
         materialHandle = reinterpret_cast<remixapi_MaterialHandle>(static_cast<uintptr_t>(materialKey));
         if (g_registeredMaterials.emplace(materialKey).second) {
           auto opaque = dxvk::LegacyMaterialData::createDefault();
 
-          if (albedoDescriptor) {
-            const auto texture = materialTextureFromDescriptor(*albedoDescriptor);
-            if (texture.isValid() && !texture.isImageEmpty())
-              opaque.setAlbedoOpacityTexture(texture);
+          if (forceWhite) {
+            // The white model path: every surface is opaque and self lit, so the
+            // captured geometry is visible regardless of the game's textures and
+            // lighting.
+            opaque.setUseLegacyAlphaState(false);
+            opaque.setBlendEnabled(false);
+            opaque.setAlphaTestType(AlphaTestType::kAlways);
+            opaque.setEmissiveIntensity(1.0f);
+            opaque.setEmissiveColorConstant(dxvk::Vector3(1.0f, 1.0f, 1.0f));
+          } else {
+            if (albedoDescriptor) {
+              const auto texture = materialTextureFromDescriptor(*albedoDescriptor);
+              if (texture.isValid() && !texture.isImageEmpty())
+                opaque.setAlbedoOpacityTexture(texture);
+            }
+            const auto sampler = materialSamplerFromDescriptors(
+              pipelineInfo->boundDescriptors);
+            if (sampler.ptr())
+              opaque.setSamplerOverride(sampler);
+            opaque.setUseLegacyAlphaState(true);
+            opaque.setBlendEnabled(pipelineInfo->blendEnabled);
+            opaque.setAlphaTestType(pipelineInfo->alphaTestEnabled
+              ? AlphaTestType::kGreater : AlphaTestType::kAlways);
+            opaque.setBlendType(BlendType::kAlpha);
           }
-          const auto sampler = materialSamplerFromDescriptors(
-            pipelineInfo->boundDescriptors);
-          if (sampler.ptr())
-            opaque.setSamplerOverride(sampler);
-          opaque.setUseLegacyAlphaState(true);
-          opaque.setBlendEnabled(pipelineInfo->blendEnabled);
-          opaque.setAlphaTestType(pipelineInfo->alphaTestEnabled
-            ? AlphaTestType::kGreater : AlphaTestType::kAlways);
-          opaque.setBlendType(BlendType::kAlpha);
           if (!g_nativeRemixApi.registerExternalMaterial(materialHandle, dxvk::MaterialData { opaque }))
             log("D3D12 native Remix material registration failed: material=%p", materialHandle);
         }
@@ -1662,6 +1748,7 @@ namespace remix {
       dxvk::CameraType::Main, view, projection);
     g_cameraWorldToView = view;
     g_cameraViewToProjection = projection;
+    g_cameraEye = dxvk::inverse(view)[3].xyz();
     g_hasCameraMatrices = true;
     g_lastCameraHash = matrixHash;
     g_lastCameraFrame = frame;
@@ -1724,6 +1811,7 @@ namespace remix {
       dxvk::CameraType::Main, view, projection);
     g_cameraWorldToView = view;
     g_cameraViewToProjection = projection;
+    g_cameraEye = dxvk::inverse(view)[3].xyz();
     g_hasCameraMatrices = true;
     g_lastCameraHash = matrixHash;
     g_lastCameraFrame = frame;
@@ -1767,6 +1855,14 @@ namespace remix {
       log("D3D12 native Remix output toggled: enabled=%u", enabled ? 1u : 0u);
     }
     g_remixOutputKeyDown = outputKeyDown;
+
+    const bool whiteKeyDown = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+    if (whiteKeyDown && !g_whiteMaterialKeyDown) {
+      const bool enabled = g_forceWhiteMaterials.load(std::memory_order_relaxed) == 0;
+      g_forceWhiteMaterials.store(enabled ? 1u : 0u, std::memory_order_relaxed);
+      log("ACZ white model materials: enabled=%u", enabled ? 1u : 0u);
+    }
+    g_whiteMaterialKeyDown = whiteKeyDown;
 
     if (!g_remixOutputEnabled.load(std::memory_order_relaxed)) {
       const uint32_t frame = g_device->getCurrentFrameId();
@@ -1946,6 +2042,18 @@ namespace remix {
         static_cast<double>(g_cameraWorldToView[3][2]),
         g_remixOutputEnabled.load(std::memory_order_relaxed) ? 1u : 0u,
         g_worldSpacePolicy.load(std::memory_order_relaxed));
+      {
+        const float nearestSq = std::sqrt(
+          g_nativeNearestInstanceDistanceSq.exchange(3.4e38f, std::memory_order_relaxed));
+        const uint32_t nearInstances =
+          g_nativeNearInstances.exchange(0, std::memory_order_relaxed);
+        log("ACZ instance distance window: eye=(%.1f,%.1f,%.1f) nearest=%.1f nearInstances=%u",
+          static_cast<double>(g_cameraEye.x),
+          static_cast<double>(g_cameraEye.y),
+          static_cast<double>(g_cameraEye.z),
+          static_cast<double>(nearestSq),
+          nearInstances);
+      }
       auto& windowSceneManager = g_device->getCommon()->getSceneManager();
       log("D3D12 native scene window: meshes=%llu instances=%u surfaces=%u",
         static_cast<unsigned long long>(g_sceneMeshSerial),
