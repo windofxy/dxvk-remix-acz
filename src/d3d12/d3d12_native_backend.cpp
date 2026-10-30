@@ -83,6 +83,58 @@ namespace remix {
     // White model mode: every surface is submitted opaque and self lit, so the
     // captured geometry is visible without the game's textures. F7 toggles it.
     std::atomic<uint32_t> g_forceWhiteMaterials { 1 };
+
+    // Vertex shaders that draw object geometry with a per-object matrix. The
+    // white model path leaves these lit rather than self lit, because a self lit
+    // aircraft and a self lit terrain are the same white and the aircraft
+    // disappears into the ground behind it.
+    bool isAczModelShader(uint64_t hash) {
+      switch (hash) {
+      case 0xb6a7d1d096ce8fe7ull:  // DrawACM_v, aircraft
+      case 0xeb39ece513987798ull:  // DrawModelGsh_v
+      case 0x8a562777e73aa8d5ull:  // DrawModelIcon_v
+      case 0x3c10411c7e513ba4ull:  // DrawSelMap_v
+      case 0x9fcd88e1b090fcaaull:  // DrawModelShadow_v
+        return true;
+      default:
+        return false;
+      }
+    }
+    // Fate counters for the aircraft draw, so a draw that never reaches Remix can
+    // be attributed to one stage instead of being looked for in the frame. Only
+    // DrawACM_v is counted; the stages are the exits of the capture path.
+    enum AircraftStage : uint32_t {
+      kAircraftDraw,
+      kAircraftSubmitted,
+      kAircraftGated,
+      kAircraftTopology,
+      kAircraftUnreadable,
+      kAircraftIdentity,
+      kAircraftNoTransform,
+      kAircraftApiRejected,
+      kAircraftStageCount,
+    };
+
+    std::atomic<uint64_t> g_aircraftStages[kAircraftStageCount];
+
+    void noteAircraftDraw(uint64_t shaderHash, AircraftStage stage) {
+      if (shaderHash != 0xb6a7d1d096ce8fe7ull)
+        return;
+      const uint64_t value = g_aircraftStages[stage].fetch_add(
+        1, std::memory_order_relaxed) + 1;
+      if (stage == kAircraftDraw && (value % 512) == 0) {
+        log("ACZ aircraft verdict: draws=%llu submitted=%llu gated=%llu topology=%llu unreadable=%llu identity=%llu noTransform=%llu apiRejected=%llu",
+          static_cast<unsigned long long>(g_aircraftStages[kAircraftDraw].load(std::memory_order_relaxed)),
+          static_cast<unsigned long long>(g_aircraftStages[kAircraftSubmitted].load(std::memory_order_relaxed)),
+          static_cast<unsigned long long>(g_aircraftStages[kAircraftGated].load(std::memory_order_relaxed)),
+          static_cast<unsigned long long>(g_aircraftStages[kAircraftTopology].load(std::memory_order_relaxed)),
+          static_cast<unsigned long long>(g_aircraftStages[kAircraftUnreadable].load(std::memory_order_relaxed)),
+          static_cast<unsigned long long>(g_aircraftStages[kAircraftIdentity].load(std::memory_order_relaxed)),
+          static_cast<unsigned long long>(g_aircraftStages[kAircraftNoTransform].load(std::memory_order_relaxed)),
+          static_cast<unsigned long long>(g_aircraftStages[kAircraftApiRejected].load(std::memory_order_relaxed)));
+      }
+    }
+
     std::atomic<uint64_t> g_nativeReadFailures { 0 };
     std::atomic<uint64_t> g_nativeConversionFailures { 0 };
     std::atomic<uint64_t> g_nativeAcceptedInstances { 0 };
@@ -1167,6 +1219,8 @@ namespace remix {
       if (!handle || !g_sceneInitialized || !g_rtxContext.ptr() || !pipelineInfo) {
         logBridgeStageOnce("instance not ready");
         g_nativeNoTransform.fetch_add(1, std::memory_order_relaxed);
+        noteAircraftDraw(pipelineInfo ? pipelineInfo->vertexShaderHash : 0ull,
+          kAircraftNoTransform);
         const uint32_t diagnostic = g_transformRejectionDiagnostics.fetch_add(
           1, std::memory_order_relaxed);
         if (diagnostic < 64 && pipelineInfo) {
@@ -1196,6 +1250,7 @@ namespace remix {
         if (!worldSpaceCandidate) {
           logBridgeStageOnce("instance no transform");
           g_nativeNoTransform.fetch_add(1, std::memory_order_relaxed);
+          noteAircraftDraw(pipelineInfo->vertexShaderHash, kAircraftNoTransform);
           const uint32_t diagnostic = g_transformRejectionDiagnostics.fetch_add(
             1, std::memory_order_relaxed);
           if (diagnostic < 64) {
@@ -1243,6 +1298,7 @@ namespace remix {
       if (identityTransform && !worldSpaceCandidate && !kAcceptIdentityAsWorldSpace) {
         logBridgeStageOnce("instance identity");
         g_nativeIdentityFiltered.fetch_add(1, std::memory_order_relaxed);
+        noteAircraftDraw(pipelineInfo->vertexShaderHash, kAircraftIdentity);
         const uint32_t filtered = g_filteredOriginDrawCount.fetch_add(
           1, std::memory_order_relaxed);
         if (filtered < 64) {
@@ -1316,21 +1372,136 @@ namespace remix {
       const uint32_t accepted = g_nativeRemixApi.commitExternalGeometry(std::move(state));
       if (accepted) {
         g_nativeAcceptedInstances.fetch_add(1, std::memory_order_relaxed);
+        noteAircraftDraw(pipelineInfo->vertexShaderHash, kAircraftSubmitted);
       accumulateInstanceBounds(*pipelineInfo);
       {
-        static uint32_t instanceLogs = 0;
-        if (instanceLogs < 6) {
-          ++instanceLogs;
-          log("ACZ instance: draw=%llu vs=0x%016llx t=(%.2f,%.2f,%.2f)",
+        // Model instances are sampled across the whole session rather than at the
+        // start, so the frames the game is actually played in are covered. The
+        // distance to the camera says whether the instance is where it belongs.
+        static std::atomic<uint32_t> instanceLogs { 0 };
+        const uint32_t instanceLog = instanceLogs.fetch_add(1, std::memory_order_relaxed);
+        if ((instanceLog % 256) == 0 && instanceLog < 8192) {
+          const auto& m = pipelineInfo->objectToWorld;
+          const float dx = m[12] - g_cameraEye.x;
+          const float dy = m[13] - g_cameraEye.y;
+          const float dz = m[14] - g_cameraEye.z;
+          log("ACZ instance: draw=%llu vs=0x%016llx t=(%.2f,%.2f,%.2f) eyeDistance=%.1f indices=%u stride=%u",
             static_cast<unsigned long long>(pipelineInfo->drawId),
             static_cast<unsigned long long>(pipelineInfo->vertexShaderHash),
-            static_cast<double>(pipelineInfo->objectToWorld[12]),
-            static_cast<double>(pipelineInfo->objectToWorld[13]),
-            static_cast<double>(pipelineInfo->objectToWorld[14]));
+            static_cast<double>(m[12]), static_cast<double>(m[13]),
+            static_cast<double>(m[14]),
+            static_cast<double>(std::sqrt(dx * dx + dy * dy + dz * dz)),
+            pipelineInfo->indexCount, pipelineInfo->vertexBufferStride);
         }
       }
         if (worldSpaceCandidate)
           g_nativeWorldSpaceInstances.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        noteAircraftDraw(pipelineInfo->vertexShaderHash, kAircraftApiRejected);
+      }
+      // The player's aircraft is whichever airframe lands nearest the camera, so
+      // one line per frame reports that one instead of sampling whichever draw
+      // the counter happens to hit. The frame that just ended is flushed when the
+      // next one starts.
+      if (pipelineInfo->vertexShaderHash == 0xb6a7d1d096ce8fe7ull
+       && pipelineInfo->indexCount >= 512) {
+        struct NearestAirframe {
+          uint32_t frame = 0;
+          uint64_t draw = 0;
+          float distance = 0.0f;
+          float position[3] = {};
+          uint32_t indices = 0;
+          uint32_t accepted = 0;
+        };
+        static NearestAirframe nearest;
+        const uint32_t frame = g_device.ptr() ? g_device->getCurrentFrameId() : 0u;
+        if (frame != nearest.frame) {
+          if (nearest.draw) {
+            log("ACZ nearest airframe: frame=%u draw=%llu accepted=%u t=(%.2f,%.2f,%.2f) eye=(%.1f,%.1f,%.1f) eyeDistance=%.1f indices=%u",
+              nearest.frame,
+              static_cast<unsigned long long>(nearest.draw),
+              nearest.accepted,
+              static_cast<double>(nearest.position[0]),
+              static_cast<double>(nearest.position[1]),
+              static_cast<double>(nearest.position[2]),
+              static_cast<double>(g_cameraEye.x), static_cast<double>(g_cameraEye.y),
+              static_cast<double>(g_cameraEye.z),
+              static_cast<double>(nearest.distance),
+              nearest.indices);
+          }
+          nearest = {};
+          nearest.frame = frame;
+        }
+        const auto& m = pipelineInfo->objectToWorld;
+        const float dx = m[12] - g_cameraEye.x;
+        const float dy = m[13] - g_cameraEye.y;
+        const float dz = m[14] - g_cameraEye.z;
+        const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (!nearest.draw || distance < nearest.distance) {
+          nearest.draw = pipelineInfo->drawId;
+          nearest.distance = distance;
+          nearest.position[0] = m[12];
+          nearest.position[1] = m[13];
+          nearest.position[2] = m[14];
+          nearest.indices = pipelineInfo->indexCount;
+          nearest.accepted = accepted ? 1u : 0u;
+        }
+
+        // Whether the airframe's vertices are already in world space decides if it
+        // needs a placement at all, so the first two are logged beside the matrix
+        // the layer would apply to them.
+        if (distance > 1000.0f && pipelineInfo->vertexBufferLocation
+         && pipelineInfo->vertexBufferStride >= sizeof(float) * 3) {
+          static std::atomic<uint32_t> vertexLogs { 0 };
+          if (vertexLogs.fetch_add(1, std::memory_order_relaxed) < 6) {
+            std::vector<uint8_t> bytes;
+            if (readGpuBuffer(pipelineInfo->vertexBufferLocation,
+                  static_cast<size_t>(pipelineInfo->vertexBufferStride) * 2, bytes)
+             && bytes.size() >= sizeof(float) * 6) {
+              const auto* v0 = reinterpret_cast<const float*>(bytes.data());
+              const auto* v1 = reinterpret_cast<const float*>(
+                bytes.data() + pipelineInfo->vertexBufferStride);
+              log("ACZ airframe vertices: draw=%llu stride=%u v0=(%.2f,%.2f,%.2f) v1=(%.2f,%.2f,%.2f) appliedT=(%.2f,%.2f,%.2f)",
+                static_cast<unsigned long long>(pipelineInfo->drawId),
+                pipelineInfo->vertexBufferStride,
+                static_cast<double>(v0[0]), static_cast<double>(v0[1]),
+                static_cast<double>(v0[2]),
+                static_cast<double>(v1[0]), static_cast<double>(v1[1]),
+                static_cast<double>(v1[2]),
+                static_cast<double>(pipelineInfo->objectToWorld[12]),
+                static_cast<double>(pipelineInfo->objectToWorld[13]),
+                static_cast<double>(pipelineInfo->objectToWorld[14]));
+            }
+          }
+        }
+
+        // The airframe whose placement is wrong gets its whole candidate block
+        // dumped, so the offset that holds the world position is found by content
+        // instead of by assumption.
+        if (distance > 1000.0f && pipelineInfo->objectTransformCbv) {
+          static std::atomic<uint32_t> blockDumps { 0 };
+          static uint32_t lastBlockFrame = 0;
+          if (blockDumps.fetch_add(1, std::memory_order_relaxed) < 3
+           && frame != lastBlockFrame) {
+            lastBlockFrame = frame;
+            std::vector<uint8_t> block;
+            if (readGpuBuffer(pipelineInfo->objectTransformCbv, 0x1A0, block)
+             && block.size() >= 0x1A0) {
+              log("ACZ airframe block: frame=%u draw=%llu cbv=0x%llx eye=(%.1f,%.1f,%.1f)",
+                frame, static_cast<unsigned long long>(pipelineInfo->drawId),
+                static_cast<unsigned long long>(pipelineInfo->objectTransformCbv),
+                static_cast<double>(g_cameraEye.x), static_cast<double>(g_cameraEye.y),
+                static_cast<double>(g_cameraEye.z));
+              for (uint32_t row = 0; row < 26; ++row) {
+                const auto* v = reinterpret_cast<const float*>(block.data() + row * 16);
+                log("ACZ airframe block +0x%03X: %13.4f %13.4f %13.4f %13.4f",
+                  row * 16,
+                  static_cast<double>(v[0]), static_cast<double>(v[1]),
+                  static_cast<double>(v[2]), static_cast<double>(v[3]));
+              }
+            }
+          }
+        }
       }
       const bool instanceAdded =
         accepted != 0 && sceneManager.getInstanceManager().getActiveCount() > instancesBefore;
@@ -1353,6 +1524,8 @@ namespace remix {
        || topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) {
         static std::mutex gateMutex;
         static bool gateLogged = false;
+        noteAircraftDraw(pipelineInfo ? pipelineInfo->vertexShaderHash : 0ull,
+          kAircraftGated);
         std::lock_guard lock(gateMutex);
         if (!gateLogged) {
           gateLogged = true;
@@ -1464,21 +1637,39 @@ namespace remix {
           }
         }
         const bool forceWhite = g_forceWhiteMaterials.load(std::memory_order_relaxed) != 0;
+        const bool litWhite = forceWhite
+          && isAczModelShader(pipelineInfo->vertexShaderHash);
         materialKey = XXH64(&forceWhite, sizeof(forceWhite), materialKey);
+        materialKey = XXH64(&litWhite, sizeof(litWhite), materialKey);
         materialKey = (materialKey | 0x1000ull);
         materialHandle = reinterpret_cast<remixapi_MaterialHandle>(static_cast<uintptr_t>(materialKey));
         if (g_registeredMaterials.emplace(materialKey).second) {
           auto opaque = dxvk::LegacyMaterialData::createDefault();
 
           if (forceWhite) {
-            // The white model path: every surface is opaque and self lit, so the
+            // The white model path: every surface is opaque and untextured, so the
             // captured geometry is visible regardless of the game's textures and
-            // lighting.
+            // lighting. Object geometry stays lit so it keeps a readable shape.
             opaque.setUseLegacyAlphaState(false);
             opaque.setBlendEnabled(false);
             opaque.setAlphaTestType(AlphaTestType::kAlways);
             opaque.setEmissiveIntensity(1.0f);
-            opaque.setEmissiveColorConstant(dxvk::Vector3(1.0f, 1.0f, 1.0f));
+            // Object geometry is tinted instead of white so that it stays
+            // distinguishable from the white terrain and so that a draw which is
+            // missing from the frame can be told apart from one that is merely
+            // white against white.
+            opaque.setEmissiveColorConstant(litWhite
+              ? dxvk::Vector3(1.0f, 0.35f, 0.05f)
+              : dxvk::Vector3(1.0f, 1.0f, 1.0f));
+            {
+              static std::atomic<uint32_t> whiteLogs { 0 };
+              const uint32_t index = whiteLogs.fetch_add(1, std::memory_order_relaxed);
+              if (index < 4) {
+                log("D3D12 white model material: vs=0x%016llx selfLit=%u",
+                  static_cast<unsigned long long>(pipelineInfo->vertexShaderHash),
+                  litWhite ? 0u : 1u);
+              }
+            }
           } else {
             if (albedoDescriptor) {
               const auto texture = materialTextureFromDescriptor(*albedoDescriptor);
@@ -2074,6 +2265,8 @@ namespace remix {
       const D3D12NativePipelineInfo* pipelineInfo) {
     std::lock_guard lock(g_backendMutex);
     PerfScope submitScope { g_nativeSubmitTicks, g_nativeSubmitCalls };
+    noteAircraftDraw(pipelineInfo ? pipelineInfo->vertexShaderHash : 0ull,
+      kAircraftDraw);
     if (!g_initialized || !g_sceneInitialized || !vertexBuffer.BufferLocation
      || !vertexBuffer.StrideInBytes
      || instanceCount == 0 || startInstanceLocation != 0)
@@ -2102,6 +2295,8 @@ namespace remix {
       // used by tessellated draws are the ones that reach this branch.
       static std::mutex topologyMutex;
       static std::unordered_set<uint32_t> loggedTopologies;
+      noteAircraftDraw(pipelineInfo ? pipelineInfo->vertexShaderHash : 0ull,
+        kAircraftTopology);
       if (sourceIndexStride) {
         std::lock_guard lock(topologyMutex);
         if (loggedTopologies.insert(static_cast<uint32_t>(topology)).second) {
@@ -2154,6 +2349,8 @@ namespace remix {
         indexBuffer.BufferLocation + static_cast<uint64_t>(startIndexLocation) * sourceIndexStride,
         indexBytes, sourceIndices)) {
       g_nativeReadFailures.fetch_add(1, std::memory_order_relaxed);
+      noteAircraftDraw(pipelineInfo ? pipelineInfo->vertexShaderHash : 0ull,
+        kAircraftUnreadable);
       return;
     }
 

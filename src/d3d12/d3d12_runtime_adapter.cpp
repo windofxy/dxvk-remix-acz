@@ -146,6 +146,12 @@ namespace remix {
     std::unordered_set<uint64_t> g_loggedNativeBindings;
     constexpr size_t kMaxNativeBindingSnapshots = 8192;
 
+    // GPU address of the structured buffer the model vertex shaders read their
+    // transform from, captured from the view that creates it. Zero until that
+    // view exists.
+    std::atomic<uint64_t> g_aczSrtBufferAddress { 0 };
+    std::atomic<uint32_t> g_aczSrtBufferElements { 0 };
+
     // Row-vector 4x4 product, so the second operand is applied after the first.
     void multiplyRowVectorMatrices(const float* left, const float* right, float* out) {
       for (uint32_t row = 0; row < 4; ++row) {
@@ -529,11 +535,15 @@ namespace remix {
       }
     }
 
+    // `maxMagnitude` guards against reading a non-matrix. A fused model-to-clip
+    // matrix legitimately reaches 1e9 because it carries the projection scale,
+    // so that caller passes a wider limit and relies on the affine test instead.
     bool readMatrixFromShaderBuffer(
         D3D12_GPU_VIRTUAL_ADDRESS gpuAddress,
         UINT64 resourceWidth,
         uint32_t offset,
-        std::array<float, 16>& result) {
+        std::array<float, 16>& result,
+        float maxMagnitude = 1.0e7f) {
       if (!gpuAddress || resourceWidth < offset + sizeof(float) * 16)
         return false;
 
@@ -544,7 +554,7 @@ namespace remix {
 
       const auto* matrix = reinterpret_cast<const float*>(bytes.data());
       for (unsigned i = 0; i < 16; ++i) {
-        if (!std::isfinite(matrix[i]) || std::abs(matrix[i]) > 1.0e7f)
+        if (!std::isfinite(matrix[i]) || std::abs(matrix[i]) > maxMagnitude)
           return false;
       }
       std::copy(matrix, matrix + 16, result.begin());
@@ -1133,7 +1143,9 @@ namespace remix {
     std::lock_guard lock(g_frameMutex);
     g_descriptorHeaps[heap] = DescriptorHeapMetadata {
       cpuStart, gpuStart, increment, description.NumDescriptors, description.Type };
-    log("D3D12 native frontend descriptor heap: heap=%p type=%u count=%u flags=0x%x cpu=0x%llx gpu=0x%llx increment=%u",
+    // The heap ranges are what lets a draw's descriptor be read straight out of
+    // host memory, so they are logged under a prefix that is never filtered.
+    log("ACZ heap: heap=%p type=%u count=%u flags=0x%x cpu=0x%llx gpu=0x%llx increment=%u",
       heap,
       static_cast<unsigned>(description.Type),
       description.NumDescriptors,
@@ -1187,6 +1199,39 @@ namespace remix {
           static_cast<unsigned long long>(srv->Buffer.FirstElement),
           srv->Buffer.NumElements,
           srv->Buffer.StructureByteStride);
+        // Structured buffers wide enough to hold per-object data are the ones the
+        // model vertex shaders read their transform from, so they are reported
+        // under a tag that is never filtered out of the log.
+        // A view may leave the stride at zero and take it from the resource, so
+        // both have to be consulted before deciding this is a wide structured
+        // buffer.
+        // A view may leave the stride at zero for a structured buffer, in which
+        // case the stride is derived from the resource width and element count.
+        const UINT effectiveStride = srv->Buffer.StructureByteStride
+          ? srv->Buffer.StructureByteStride
+          : (srv->Buffer.NumElements
+            ? static_cast<UINT>(resourceDesc.Width / srv->Buffer.NumElements)
+            : 0u);
+        {
+          if (effectiveStride == 416 && metadata.resourceGpuAddress) {
+            g_aczSrtBufferAddress.store(
+              metadata.resourceGpuAddress
+                + static_cast<uint64_t>(srv->Buffer.FirstElement) * effectiveStride,
+              std::memory_order_relaxed);
+            g_aczSrtBufferElements.store(srv->Buffer.NumElements, std::memory_order_relaxed);
+          }
+          static std::atomic<uint32_t> bufferSrvLogs { 0 };
+          const uint32_t index = bufferSrvLogs.fetch_add(1, std::memory_order_relaxed);
+          if (index < 24) {
+            log("ACZ buffer SRV: cpu=0x%llx gpu=0x%llx stride=%u elements=%u first=%llu width=%llu",
+              static_cast<unsigned long long>(cpuHandle.ptr),
+              static_cast<unsigned long long>(metadata.resourceGpuAddress),
+              effectiveStride,
+              srv->Buffer.NumElements,
+              static_cast<unsigned long long>(srv->Buffer.FirstElement),
+              static_cast<unsigned long long>(resourceDesc.Width));
+          }
+        }
       } else {
         UINT mostDetailedMip = 0;
         UINT mipLevels = 0;
@@ -1357,13 +1402,7 @@ namespace remix {
       return;
     for (UINT i = 0; i < count; ++i) {
       const auto& barrier = barriers[i];
-      if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
-        recordResourceBarrier(
-          barrier.Transition.pResource,
-          barrier.Transition.StateBefore,
-          barrier.Transition.StateAfter,
-          barrier.Transition.Subresource);
-      } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
+      if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
         std::lock_guard lock(g_frameMutex);
         const ID3D12Resource* resources[] = {
           barrier.Aliasing.pResourceBefore,
@@ -1761,7 +1800,7 @@ namespace remix {
       return reject(kFusedNoBuffer);
 
     std::array<float, 16> modelToClip {};
-    if (!readMatrixFromShaderBuffer(buffer, bufferWidth, 0x000, modelToClip))
+    if (!readMatrixFromShaderBuffer(buffer, bufferWidth, 0x000, modelToClip, 1.0e12f))
       return reject(kFusedUnreadableMatrix);
     if (isIdentityObjectTransform(modelToClip))
       return reject(kFusedIdentityMatrix);
@@ -1874,6 +1913,137 @@ namespace remix {
     }
 
     return true;
+  }
+
+  // Vertex shaders that place object space geometry with a per-draw matrix. Their
+  // transforms come from the structured buffer described in acz-shaders.md, so
+  // only these draws are worth probing for one.
+  //
+  // `DrawCPT_v` is deliberately absent: it declares no SV_Position output, passes
+  // its ATTRIBUTE0 through to a generic POSITION and writes a clamped 0..1 value
+  // into the fourth component, so it draws a screen space overlay rather than
+  // object space geometry and has no placement to recover.
+  bool isModelVertexShader(uint64_t hash) {
+    switch (hash) {
+    case 0xb6a7d1d096ce8fe7ull:  // DrawACM_v, aircraft
+    case 0xeb39ece513987798ull:  // DrawModelGsh_v
+    case 0x8a562777e73aa8d5ull:  // DrawModelIcon_v
+    case 0x3c10411c7e513ba4ull:  // DrawSelMap_v
+    case 0x9fcd88e1b090fcaaull:  // DrawModelShadow_v
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  // Object geometry that reports its placement relative to the camera rather
+  // than in world space. The terrain submits absolute world coordinates, so the
+  // two conventions have to be told apart per shader.
+  bool placesInCameraRelativeFrame(uint64_t hash) {
+    switch (hash) {
+    case 0xb6a7d1d096ce8fe7ull:  // DrawACM_v, aircraft
+    case 0xeb39ece513987798ull:  // DrawModelGsh_v
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  // How a draw's geometry has to be placed, decided by its vertex shader. Each
+  // family in acz-shaders.md transforms differently, so one generic placement
+  // cannot cover them all; the mode is looked up per shader instead and every
+  // draw is routed through its own rule.
+  enum class AczPlacementMode : uint8_t {
+    kScreenSpace,      // Vertices are already in clip space; nothing to place.
+    kWorldSpace,       // Vertices are already in world space; identity placement.
+    kObjectMatrix,     // Model space vertices with one readable object matrix.
+    kBlendedMatrices,  // Model space vertices blended from the SrtData buffer.
+    kProbing,          // Not classified yet, keep validating candidates.
+  };
+
+  AczPlacementMode aczPlacementModeFor(uint64_t hash) {
+    switch (hash) {
+    case 0xdbac2cdada190473ull:  // DrawCPT_v, cockpit overlay
+    case 0x110c4e2ff4ad2b54ull:  // ps2_v
+    case 0x3f0ddb245dcbdd6full:  // ps2Line_v
+    case 0x9f0c04b171687f1eull:  // ps2AtestCA_v
+      return AczPlacementMode::kScreenSpace;
+    case 0xb6a7d1d096ce8fe7ull:  // DrawACM_v, aircraft
+    case 0xeb39ece513987798ull:  // DrawModelGsh_v
+    case 0x8a562777e73aa8d5ull:  // DrawModelIcon_v
+      return AczPlacementMode::kBlendedMatrices;
+    case 0x3c10411c7e513ba4ull:  // DrawSelMap_v
+    case 0x9fcd88e1b090fcaaull:  // DrawModelShadow_v
+      return AczPlacementMode::kObjectMatrix;
+    default:
+      return AczPlacementMode::kProbing;
+    }
+  }
+
+  // Reads the descriptors bound to a draw straight out of the descriptor heap and
+  // collects every word that looks like a GPU address. The layer holds no views for
+  // these descriptors and the model shaders read their matrices through them, so
+  // the words are taken as they are and validated by content afterwards.
+  void collectDescriptorAddresses(
+      const D3D12_GPU_DESCRIPTOR_HANDLE* tables,
+      D3D12_GPU_VIRTUAL_ADDRESS* out,
+      uint32_t& count,
+      uint32_t maxAddresses) {
+    if (!tables)
+      return;
+
+    constexpr size_t kMaxTables = 8;
+    constexpr uint32_t kDescriptorOffsets = 8;
+    constexpr uint64_t kMinGpuAddress = 0x100000000ull;
+    constexpr uint64_t kMaxGpuAddress = 0x7fffffffffffull;
+
+    std::lock_guard lock(g_frameMutex);
+    for (size_t table = 0; table < kMaxTables && count < maxAddresses; ++table) {
+      const uint64_t tableGpu = tables[table].ptr;
+      if (!tableGpu)
+        continue;
+
+      const DescriptorHeapMetadata* heap = nullptr;
+      for (const auto& entry : g_descriptorHeaps) {
+        const auto& metadata = entry.second;
+        if (!metadata.gpuStart.ptr || !metadata.increment || tableGpu < metadata.gpuStart.ptr)
+          continue;
+        const uint64_t delta = tableGpu - metadata.gpuStart.ptr;
+        if (delta % metadata.increment)
+          continue;
+        if (delta / metadata.increment >= metadata.count)
+          continue;
+        heap = &metadata;
+        break;
+      }
+      if (!heap)
+        continue;
+
+      const uint64_t baseIndex = (tableGpu - heap->gpuStart.ptr) / heap->increment;
+      for (uint32_t offset = 0; offset < kDescriptorOffsets && count < maxAddresses; ++offset) {
+        const uint64_t index = baseIndex + offset;
+        if (index >= heap->count)
+          break;
+        const uint64_t cpu = heap->cpuStart.ptr + index * heap->increment;
+
+        for (uint32_t word = 0; word < 4 && count < maxAddresses; ++word) {
+          uint64_t value = 0;
+          std::memcpy(&value, reinterpret_cast<const void*>(cpu + word * 8), sizeof(value));
+          if (value < kMinGpuAddress || value > kMaxGpuAddress || (value & 0xf) != 0)
+            continue;
+          bool duplicate = false;
+          for (uint32_t i = 0; i < count; ++i) {
+            if (out[i] == value) {
+              duplicate = true;
+              break;
+            }
+          }
+          if (duplicate)
+            continue;
+          out[count++] = static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(value);
+        }
+      }
+    }
   }
 
   // Collects the buffer views bound to a draw. The model vertex shader reads its
@@ -2027,67 +2197,148 @@ namespace remix {
     return composeFusedMatrix(modelToClip, objectToWorld, result);
   }
 
-  // Enumerates the tracked buffer views and reports their leading content, so the
-  // structured buffer that carries the fused matrices can be located by what it
-  // holds rather than by which root parameter binds it. The draw's own tables are
-  // already known not to carry it, so this walks every view the layer has seen.
-  void reportTrackedBufferViews(uint64_t drawId, uint64_t frameId, bool forced) {
-    static std::atomic<uint32_t> reports { 0 };
-    if (!forced && reports.fetch_add(1, std::memory_order_relaxed) >= 2)
+  // The model record is read through a single descriptor of an SRV table as a
+  // 26-element typed buffer, so the descriptor names the record itself: its byte
+  // size is the record size and it carries no structure stride. Only the
+  // descriptor words are read, which costs one read per table slot.
+  // Reports the descriptor words of a model draw's tables, so the record view is
+  // read from the descriptors rather than inferred from a failed match. Bounded
+  // to three draws and sixteen slots per table.
+  void logModelDescriptorSlots(
+      const D3D12_GPU_DESCRIPTOR_HANDLE* tables,
+      uint64_t drawId) {
+    static std::atomic<uint32_t> dumps { 0 };
+    if (dumps.fetch_add(1, std::memory_order_relaxed) >= 3 || !tables)
       return;
 
-    struct Candidate {
-      D3D12_GPU_VIRTUAL_ADDRESS address;
-      UINT64 width;
-    };
-    std::vector<Candidate> candidates;
-    {
-      std::lock_guard lock(g_frameMutex);
-      for (const auto& entry : g_descriptors) {
-        const DescriptorMetadata& metadata = entry.second;
-        if (!metadata.viewType || std::strcmp(metadata.viewType, "SRV") != 0)
-          continue;
-        if (metadata.resourceDescription.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
-          continue;
-        if (!metadata.resourceGpuAddress || metadata.resourceDescription.Width < 0x100)
-          continue;
+    std::lock_guard lock(g_frameMutex);
+    for (size_t table = 0; table < 8; ++table) {
+      const uint64_t tableGpu = tables[table].ptr;
+      if (!tableGpu)
+        continue;
 
-        UINT64 firstElementOffset = 0;
-        if (metadata.viewDescriptionSize >= sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC)) {
-          const auto* srv = reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(
-            metadata.viewDescription.data());
-          if (srv->ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
-            firstElementOffset = static_cast<UINT64>(srv->Buffer.FirstElement)
-              * srv->Buffer.StructureByteStride;
-          }
-        }
-        if (metadata.resourceDescription.Width <= firstElementOffset)
+      const DescriptorHeapMetadata* heap = nullptr;
+      for (const auto& entry : g_descriptorHeaps) {
+        const auto& metadata = entry.second;
+        if (!metadata.gpuStart.ptr || !metadata.increment || tableGpu < metadata.gpuStart.ptr)
           continue;
+        const uint64_t delta = tableGpu - metadata.gpuStart.ptr;
+        if (delta % metadata.increment || delta / metadata.increment >= metadata.count)
+          continue;
+        heap = &metadata;
+        break;
+      }
+      if (!heap)
+        continue;
 
-        candidates.push_back({
-          metadata.resourceGpuAddress + firstElementOffset,
-          metadata.resourceDescription.Width - firstElementOffset });
-        if (candidates.size() >= 24)
+      const uint64_t baseIndex = (tableGpu - heap->gpuStart.ptr) / heap->increment;
+      for (uint32_t slot = 0; slot < 16; ++slot) {
+        const uint64_t index = baseIndex + slot;
+        if (index >= heap->count)
           break;
+        const uint64_t cpu = heap->cpuStart.ptr + index * heap->increment;
+
+        uint64_t bufferLocation = 0;
+        uint32_t bufferSize = 0;
+        uint32_t structureStride = 0;
+        std::memcpy(&bufferLocation, reinterpret_cast<const void*>(cpu), sizeof(bufferLocation));
+        std::memcpy(&bufferSize, reinterpret_cast<const void*>(cpu + 8), sizeof(bufferSize));
+        std::memcpy(&structureStride, reinterpret_cast<const void*>(cpu + 12),
+          sizeof(structureStride));
+        if (bufferLocation < 0x100000000ull || bufferLocation > 0x7fffffffffffull)
+          continue;
+        log("ACZ model descriptor: draw=%llu table=%zu slot=%u gpu=0x%llx size=%u stride=%u",
+          static_cast<unsigned long long>(drawId), table, slot,
+          static_cast<unsigned long long>(bufferLocation), bufferSize, structureStride);
       }
     }
+  }
 
-    log("ACZ tracked buffer views: draw=%llu frame=%llu count=%zu",
-      drawId, frameId, candidates.size());
-    for (const Candidate& candidate : candidates) {
-      std::vector<uint8_t> bytes;
-      if (!readGpuBuffer(candidate.address, 16, bytes) || bytes.size() < 16) {
-        log("ACZ tracked buffer: gpu=0x%llx width=%llu unreadable",
-          static_cast<unsigned long long>(candidate.address),
-          static_cast<unsigned long long>(candidate.width));
+  bool findModelRecordDescriptor(
+      const D3D12_GPU_DESCRIPTOR_HANDLE* tables,
+      D3D12_GPU_VIRTUAL_ADDRESS& address,
+      uint32_t& tableSlot) {
+    constexpr uint32_t kRecordBytes = 416;
+    constexpr uint32_t kSlotLimit = 32;
+
+    if (!tables)
+      return false;
+
+    std::lock_guard lock(g_frameMutex);
+    for (size_t table = 0; table < 8; ++table) {
+      const uint64_t tableGpu = tables[table].ptr;
+      if (!tableGpu)
         continue;
+
+      const DescriptorHeapMetadata* heap = nullptr;
+      for (const auto& entry : g_descriptorHeaps) {
+        const auto& metadata = entry.second;
+        if (!metadata.gpuStart.ptr || !metadata.increment || tableGpu < metadata.gpuStart.ptr)
+          continue;
+        const uint64_t delta = tableGpu - metadata.gpuStart.ptr;
+        if (delta % metadata.increment || delta / metadata.increment >= metadata.count)
+          continue;
+        heap = &metadata;
+        break;
       }
-      const auto* values = reinterpret_cast<const float*>(bytes.data());
-      log("ACZ tracked buffer: gpu=0x%llx width=%llu first=(%.6g,%.6g,%.6g,%.6g)",
-        static_cast<unsigned long long>(candidate.address),
-        static_cast<unsigned long long>(candidate.width),
-        static_cast<double>(values[0]), static_cast<double>(values[1]),
-        static_cast<double>(values[2]), static_cast<double>(values[3]));
+      if (!heap)
+        continue;
+
+      const uint64_t baseIndex = (tableGpu - heap->gpuStart.ptr) / heap->increment;
+      for (uint32_t slot = 0; slot < kSlotLimit; ++slot) {
+        const uint64_t index = baseIndex + slot;
+        if (index >= heap->count)
+          break;
+        const uint64_t cpu = heap->cpuStart.ptr + index * heap->increment;
+
+        uint64_t bufferLocation = 0;
+        uint32_t bufferSize = 0;
+        uint32_t structureStride = 0;
+        std::memcpy(&bufferLocation, reinterpret_cast<const void*>(cpu), sizeof(bufferLocation));
+        std::memcpy(&bufferSize, reinterpret_cast<const void*>(cpu + 8), sizeof(bufferSize));
+        std::memcpy(&structureStride, reinterpret_cast<const void*>(cpu + 12),
+          sizeof(structureStride));
+        if (structureStride || bufferSize != kRecordBytes)
+          continue;
+        if (bufferLocation < 0x100000000ull || bufferLocation > 0x7fffffffffffull)
+          continue;
+        if ((bufferLocation & 0xf) != 0)
+          continue;
+
+        address = bufferLocation;
+        tableSlot = slot;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Dumps the record once its descriptor is known, so the matrix order is read
+  // off the values instead of being inferred from a placement result.
+  void logAczModelRecord(uint64_t drawId, D3D12_GPU_VIRTUAL_ADDRESS address, uint32_t tableSlot) {
+    static std::atomic<uint32_t> dumps { 0 };
+    const uint32_t dumpIndex = dumps.fetch_add(1, std::memory_order_relaxed);
+    if (dumpIndex >= 4)
+      return;
+
+    std::vector<uint8_t> bytes;
+    if (!readGpuBuffer(address, 416, bytes) || bytes.size() < 416) {
+      log("ACZ model record: draw=%llu address=0x%llx slot=%u unreadable",
+        static_cast<unsigned long long>(drawId),
+        static_cast<unsigned long long>(address), tableSlot);
+      return;
+    }
+
+    log("ACZ model record: draw=%llu address=0x%llx slot=%u",
+      static_cast<unsigned long long>(drawId),
+      static_cast<unsigned long long>(address), tableSlot);
+    const auto* values = reinterpret_cast<const float*>(bytes.data());
+    for (uint32_t row = 0; row < 26; ++row) {
+      log("ACZ model record +0x%03X: %12.5f %12.5f %12.5f %12.5f", row * 16,
+        static_cast<double>(values[row * 4 + 0]),
+        static_cast<double>(values[row * 4 + 1]),
+        static_cast<double>(values[row * 4 + 2]),
+        static_cast<double>(values[row * 4 + 3]));
     }
   }
 
@@ -2400,10 +2651,35 @@ namespace remix {
       }
     }
     const uint64_t transformStartTicks = perfTicks();
+    // Screen space families transform their vertices on the CPU already, so
+    // submitting them as world geometry can only produce garbage. They are
+    // dropped here, before any placement work, and counted so the routing itself
+    // stays visible.
+    const AczPlacementMode placementMode =
+      aczPlacementModeFor(nativePipelineInfo.vertexShaderHash);
+    if (placementMode == AczPlacementMode::kScreenSpace) {
+      static std::atomic<uint32_t> screenSpaceLogs { 0 };
+      const uint32_t index = screenSpaceLogs.fetch_add(1, std::memory_order_relaxed);
+      if (index < 6) {
+        log("ACZ placement mode: vs=0x%016llx mode=screenSpace dropped indices=%u",
+          static_cast<unsigned long long>(nativePipelineInfo.vertexShaderHash),
+          indexCount);
+      }
+      return;
+    }
     // Address of the draw buffer the object matrix came from, so the leading
     // matrix at +0x000 can be read from the very same binding.
     D3D12_GPU_VIRTUAL_ADDRESS drawBufferAddress = 0;
     UINT64 drawBufferWidth = 0;
+    // The model record is bound through its own descriptor, so its address is
+    // resolved before the older candidates and reported once per session.
+    D3D12_GPU_VIRTUAL_ADDRESS modelRecordAddress = 0;
+    if (placementMode == AczPlacementMode::kBlendedMatrices && indexCount >= 20) {
+      logModelDescriptorSlots(graphicsDescriptorTables, count);
+      uint32_t recordSlot = 0;
+      if (findModelRecordDescriptor(graphicsDescriptorTables, modelRecordAddress, recordSlot))
+        logAczModelRecord(count, modelRecordAddress, recordSlot);
+    }
     if (graphicsRootSrvs) {
       for (uint32_t slot = 0; slot < 16 && !nativePipelineInfo.hasObjectToWorld; ++slot) {
         const D3D12_GPU_VIRTUAL_ADDRESS address = graphicsRootSrvs[slot];
@@ -2455,10 +2731,19 @@ namespace remix {
           break;
         }
       }
+      // A matrix without a translation is a rotation only: moving objects keep
+      // their placement in another binding, so such a matrix is not a placement
+      // and the remaining slots are probed instead of accepting it.
+      const auto lacksPlacement = [&]() {
+        if (!nativePipelineInfo.hasObjectToWorld)
+          return true;
+        const auto& m = nativePipelineInfo.objectToWorld;
+        return isIdentityObjectTransform(m)
+          || std::abs(m[12]) + std::abs(m[13]) + std::abs(m[14]) < 1.0f;
+      };
       // Some pipelines bind their per-draw constants in roots 3..5 instead of
       // root 2, so those slots are probed before giving up on the transform.
-      if (!nativePipelineInfo.hasObjectToWorld
-       || isIdentityObjectTransform(nativePipelineInfo.objectToWorld)) {
+      if (lacksPlacement()) {
         for (uint32_t slot = 3; slot <= 5; ++slot) {
           const auto address = currentGraphicsRootCbv(slot);
           if (!address)
@@ -2467,7 +2752,8 @@ namespace remix {
           bool found = false;
           for (uint32_t offset = 0; offset <= 0x3c0; offset += 0x40) {
             if (!readObjectTransform(address, candidate, offset)
-             || isIdentityObjectTransform(candidate))
+             || isIdentityObjectTransform(candidate)
+             || std::abs(candidate[12]) + std::abs(candidate[13]) + std::abs(candidate[14]) < 1.0f)
               continue;
             found = true;
             break;
@@ -2539,8 +2825,6 @@ namespace remix {
         for (size_t i = 0; i < cachedAddresses.size(); ++i)
           addCandidate(cachedAddresses[i], cachedWidths[i]);
       }
-
-      reportTrackedBufferViews(count, drawFrame, (drawFrame % 600) == 0);
 
       // Raw dump of the buffer the object matrix came from, so the layout around
       // the leading matrix can be read off directly when decoding fails. One
@@ -2664,180 +2948,187 @@ namespace remix {
         break;
       }
 
-      // Nothing in the known bindings carried the matrix. The per-draw constants
-      // block keeps a candidate at +0x40, so that offset is read directly instead
-      // of scanning: the scan of the surrounding memory cost more per frame than
-      // the whole captured scene.
-      if (!fusedDecoded && indexCount >= 20) {
-        D3D12_GPU_VIRTUAL_ADDRESS arenas[4] = {};
-        uint32_t arenaCount = 0;
-        const auto addArena = [&](D3D12_GPU_VIRTUAL_ADDRESS address) {
-          if (!address || arenaCount >= 4)
+      // The model shaders read their matrices from a structured buffer whose
+      // binding the draw trace cannot map, so the descriptors bound to this draw
+      // are read straight out of the heap and every word that looks like a GPU
+      // address is probed. A placement is accepted when it is a rigid matrix that
+      // lands near the camera, which is what separates a real object matrix from
+      // the material blocks and viewport tables that share the same heap.
+      if (!fusedDecoded && indexCount >= 20
+       && isModelVertexShader(nativePipelineInfo.vertexShaderHash)) {
+        constexpr uint32_t kMaxProbes = 6;
+        constexpr uint32_t kProbeBytes = 0x140;
+
+        D3D12_GPU_VIRTUAL_ADDRESS probes[kMaxProbes] = {};
+        uint32_t probeCount = 0;
+        const auto addProbe = [&](D3D12_GPU_VIRTUAL_ADDRESS address) {
+          if (!address || probeCount >= kMaxProbes)
             return;
-          for (uint32_t i = 0; i < arenaCount; ++i) {
-            if (arenas[i] == address)
+          for (uint32_t i = 0; i < probeCount; ++i) {
+            if (probes[i] == address)
               return;
           }
-          arenas[arenaCount++] = address;
+          probes[probeCount++] = address;
         };
-        addArena(objectTransformCbv);
+        addProbe(objectTransformCbv);
         for (uint32_t slot = 0; slot <= 1; ++slot)
-          addArena(currentGraphicsRootCbv(slot));
+          addProbe(currentGraphicsRootCbv(slot));
+        collectDescriptorAddresses(graphicsDescriptorTables, probes, probeCount, kMaxProbes);
 
-        static std::atomic<uint32_t> drawLogs { 0 };
-        if (drawLogs.fetch_add(1, std::memory_order_relaxed) < 16) {
-          log("ACZ fused draw: draw=%llu vs=0x%016llx indices=%u stride=%u vb=0x%llx/%u position=%d verts=%u first=(%.4g,%.4g,%.4g) second=(%.4g,%.4g,%.4g) arenas=%u",
-            static_cast<unsigned long long>(count),
-            static_cast<unsigned long long>(nativePipelineInfo.vertexShaderHash),
-            indexCount, vertexBuffer.StrideInBytes,
-            static_cast<unsigned long long>(vertexBuffer.BufferLocation),
-            vertexBuffer.SizeInBytes,
-            hasPosition ? static_cast<int32_t>(positionOffset) : -1,
-            modelVertexCount,
-            static_cast<double>(modelVertices[0]), static_cast<double>(modelVertices[1]),
-            static_cast<double>(modelVertices[2]),
-            static_cast<double>(modelVertices[3]), static_cast<double>(modelVertices[4]),
-            static_cast<double>(modelVertices[5]), arenaCount);
+        AczCameraMatrices camera {};
+        const bool haveCamera = buildAczCamera(camera);
+        if (!haveCamera) {
+          // Without a camera nothing can be validated, so the probe is skipped
+          // instead of spending reads on candidates that cannot be accepted.
+          static std::atomic<uint32_t> noCameraLogs { 0 };
+          if (noCameraLogs.fetch_add(1, std::memory_order_relaxed) < 4) {
+            log("ACZ placement skipped: draw=%llu vs=0x%016llx indices=%u reason=no camera",
+              static_cast<unsigned long long>(count),
+              static_cast<unsigned long long>(nativePipelineInfo.vertexShaderHash),
+              indexCount);
+          }
+          probeCount = 0;
         }
 
-        // The per-draw block keeps several matrices side by side, so both the
-        // placement and the fused matrix are read from it as a pair: taking the
-        // fused matrix alone assumes an identity placement, which scales the
-        // result away from the camera and multiplies any camera motion with it.
-        constexpr uint32_t kBlockOffsets[] = { 0x000, 0x040, 0x080, 0x0C0, 0x100 };
-        constexpr uint32_t kBlockBytes = 0x140;
-
-        // A placement is usable when its rotation stays uniform and affine; the
-        // eye distance then picks among the usable pairs.
-        const auto scorePlacement = [&](const std::array<float, 16>& matrix) {
+        // A placement is a rigid affine matrix near the camera.
+        const auto rigidPlacement = [&](const std::array<float, 16>& matrix) {
+          if (!haveCamera)
+            return false;
+          if (std::abs(matrix[3]) > 0.02f || std::abs(matrix[7]) > 0.02f
+           || std::abs(matrix[11]) > 0.02f || std::abs(matrix[15] - 1.0f) > 0.02f)
+            return false;
           const float r0 = std::sqrt(matrix[0] * matrix[0] + matrix[1] * matrix[1] + matrix[2] * matrix[2]);
           const float r1 = std::sqrt(matrix[4] * matrix[4] + matrix[5] * matrix[5] + matrix[6] * matrix[6]);
           const float r2 = std::sqrt(matrix[8] * matrix[8] + matrix[9] * matrix[9] + matrix[10] * matrix[10]);
-          if (r0 < 1.0e-4f || r1 < 1.0e-4f || r2 < 1.0e-4f)
-            return -1.0f;
+          if (r0 < 1.0e-3f || r1 < 1.0e-3f || r2 < 1.0e-3f)
+            return false;
           const float largest = std::max(r0, std::max(r1, r2));
           const float smallest = std::min(r0, std::min(r1, r2));
           if (largest > smallest * 1.02f)
-            return -1.0f;
-          const float dot01 = (matrix[0] * matrix[4] + matrix[1] * matrix[5] + matrix[2] * matrix[6])
-            / (r0 * r1);
-          const float dot02 = (matrix[0] * matrix[8] + matrix[1] * matrix[9] + matrix[2] * matrix[10])
-            / (r0 * r2);
-          const float dot12 = (matrix[4] * matrix[8] + matrix[5] * matrix[9] + matrix[6] * matrix[10])
-            / (r1 * r2);
+            return false;
+          const float dot01 = (matrix[0] * matrix[4] + matrix[1] * matrix[5] + matrix[2] * matrix[6]) / (r0 * r1);
+          const float dot02 = (matrix[0] * matrix[8] + matrix[1] * matrix[9] + matrix[2] * matrix[10]) / (r0 * r2);
+          const float dot12 = (matrix[4] * matrix[8] + matrix[5] * matrix[9] + matrix[6] * matrix[10]) / (r1 * r2);
           if (std::abs(dot01) > 0.02f || std::abs(dot02) > 0.02f || std::abs(dot12) > 0.02f)
-            return -1.0f;
-          AczCameraMatrices camera {};
-          if (!buildAczCamera(camera))
-            return -1.0f;
+            return false;
           const float dx = matrix[12] - camera.eye[0];
           const float dy = matrix[13] - camera.eye[1];
           const float dz = matrix[14] - camera.eye[2];
-          return std::sqrt(dx * dx + dy * dy + dz * dz);
+          const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+          return distance > 1.0f && distance < 3000.0f;
         };
 
-        for (uint32_t i = 0; i < arenaCount && !fusedDecoded; ++i) {
+        static std::atomic<uint32_t> probeLogs { 0 };
+        for (uint32_t i = 0; i < probeCount && !fusedDecoded; ++i) {
           std::vector<uint8_t> block;
-          if (!readGpuBuffer(arenas[i], kBlockBytes, block) || block.size() < kBlockBytes)
+          if (!readGpuBuffer(probes[i], kProbeBytes, block) || block.size() < kProbeBytes)
             continue;
 
-          std::array<std::array<float, 16>, 5> matrices {};
-          for (uint32_t k = 0; k < 5; ++k)
-            std::memcpy(matrices[k].data(), block.data() + kBlockOffsets[k], sizeof(float) * 16);
-
-          // Raw dump of the per-draw block for the first few draws. The matrices
-          // are identified by their content, which is faster than guessing which
-          // offset holds the placement.
+          // Raw sample of what each candidate address holds, so the location of the
+          // structured buffer can be told apart from the material blocks by content.
           {
-            static std::atomic<uint32_t> dumps { 0 };
-            if (dumps.fetch_add(1, std::memory_order_relaxed) < 2) {
-              log("ACZ fused block: draw=%llu arena=0x%llx vs=0x%016llx indices=%u stride=%u",
+            static std::atomic<uint32_t> blockLogs { 0 };
+            if (blockLogs.fetch_add(1, std::memory_order_relaxed) < 12) {
+              const auto* fused = reinterpret_cast<const float*>(block.data());
+              const auto* object = reinterpret_cast<const float*>(block.data() + 0x100);
+              log("ACZ placement probe: draw=%llu probe=0x%llx vs=0x%016llx m0=(%.5g,%.5g,%.5g,%.5g) m4=(%.5g,%.5g,%.5g,%.5g)",
                 static_cast<unsigned long long>(count),
-                static_cast<unsigned long long>(arenas[i]),
+                static_cast<unsigned long long>(probes[i]),
                 static_cast<unsigned long long>(nativePipelineInfo.vertexShaderHash),
-                indexCount, vertexBuffer.StrideInBytes);
-              for (uint32_t row = 0; row < kBlockBytes / 16; ++row) {
-                const auto* values = reinterpret_cast<const float*>(block.data() + row * 16);
-                log("ACZ fused block +0x%03X: %12.5g %12.5g %12.5g %12.5g", row * 16,
-                  static_cast<double>(values[0]), static_cast<double>(values[1]),
-                  static_cast<double>(values[2]), static_cast<double>(values[3]));
-              }
+                static_cast<double>(fused[0]), static_cast<double>(fused[1]),
+                static_cast<double>(fused[2]), static_cast<double>(fused[3]),
+                static_cast<double>(object[0]), static_cast<double>(object[1]),
+                static_cast<double>(object[2]), static_cast<double>(object[3]));
             }
           }
 
-          float bestScore = -1.0f;
-          uint32_t bestPlacement = 0;
-          uint32_t bestFused = 0;
-          std::array<float, 16> bestResult {};
-          static std::atomic<uint32_t> pairLogs { 0 };
-          const bool logPairs = pairLogs.fetch_add(1, std::memory_order_relaxed) < 2;
-          for (uint32_t fused = 0; fused < 5; ++fused) {
-            // Index 5 means an identity placement, which is what a draw whose
-            // vertices are already in world space uses.
-            for (uint32_t placement = 0; placement <= 5; ++placement) {
-              if (placement == fused)
-                continue;
-              std::array<float, 16> base {};
-              if (placement == 5) {
-                base[0] = 1.0f;
-                base[5] = 1.0f;
-                base[10] = 1.0f;
-                base[15] = 1.0f;
-              } else {
-                base = matrices[placement];
-              }
-              std::array<float, 16> decoded {};
-              const bool composed = composeFusedMatrix(matrices[fused], base, decoded);
-              const float score = composed ? scorePlacement(decoded) : -1.0f;
-              if (logPairs) {
-                const float r0 = std::sqrt(decoded[0] * decoded[0] + decoded[1] * decoded[1]
-                  + decoded[2] * decoded[2]);
-                const float r1 = std::sqrt(decoded[4] * decoded[4] + decoded[5] * decoded[5]
-                  + decoded[6] * decoded[6]);
-                const float r2 = std::sqrt(decoded[8] * decoded[8] + decoded[9] * decoded[9]
-                  + decoded[10] * decoded[10]);
-                log("ACZ fused pair: fused=0x%X placement=0x%X composed=%u rows=(%.4f,%.4f,%.4f) t=(%.2f,%.2f,%.2f) score=%.2f",
-                  kBlockOffsets[fused],
-                  placement == 5 ? 0xFFFFu : kBlockOffsets[placement],
-                  composed ? 1u : 0u,
-                  static_cast<double>(r0), static_cast<double>(r1), static_cast<double>(r2),
-                  static_cast<double>(decoded[12]), static_cast<double>(decoded[13]),
-                  static_cast<double>(decoded[14]), static_cast<double>(score));
-              }
-              if (score < 0.0f)
-                continue;
-              if (bestScore >= 0.0f && score >= bestScore)
-                continue;
-              bestScore = score;
-              bestPlacement = placement;
-              bestFused = fused;
-              bestResult = decoded;
+          // Mode one: the placement is the object matrix at 0x100.
+          std::array<float, 16> objectMatrix {};
+          std::memcpy(objectMatrix.data(), block.data() + 0x100, sizeof(float) * 16);
+          if (rigidPlacement(objectMatrix)) {
+            if (probeLogs.fetch_add(1, std::memory_order_relaxed) < 16) {
+              log("ACZ placement from object matrix: draw=%llu probe=0x%llx vs=0x%016llx t=(%.2f,%.2f,%.2f) indices=%u",
+                static_cast<unsigned long long>(count),
+                static_cast<unsigned long long>(probes[i]),
+                static_cast<unsigned long long>(nativePipelineInfo.vertexShaderHash),
+                static_cast<double>(objectMatrix[12]), static_cast<double>(objectMatrix[13]),
+                static_cast<double>(objectMatrix[14]), indexCount);
             }
+            nativePipelineInfo.objectToWorld = objectMatrix;
+            nativePipelineInfo.hasObjectToWorld = true;
+            nativePipelineInfo.objectTransformSource = 6;
+            nativePipelineInfoPtr = &nativePipelineInfo;
+            fusedDecoded = true;
+            break;
           }
 
-          if (bestScore < 0.0f)
+          // Mode two: the placement is fused into the leading matrix.
+          std::array<float, 16> fusedMatrix {};
+          std::memcpy(fusedMatrix.data(), block.data(), sizeof(float) * 16);
+          std::array<float, 16> decoded {};
+          if (!composeFusedMatrix(fusedMatrix, basePlacement, decoded))
             continue;
-
-          static std::atomic<uint32_t> hitLogs { 0 };
-          if (hitLogs.fetch_add(1, std::memory_order_relaxed) < 20) {
-            log("ACZ fused matrix found: draw=%llu arena=0x%llx fused=0x%X placement=0x%X t=(%.3f,%.3f,%.3f) eyeDistance=%.2f indices=%u",
+          if (!rigidPlacement(decoded))
+            continue;
+          if (probeLogs.fetch_add(1, std::memory_order_relaxed) < 16) {
+            log("ACZ placement from fused matrix: draw=%llu probe=0x%llx vs=0x%016llx t=(%.2f,%.2f,%.2f) indices=%u",
               static_cast<unsigned long long>(count),
-              static_cast<unsigned long long>(arenas[i]),
-              kBlockOffsets[bestFused],
-              bestPlacement == 5 ? 0xFFFFu : kBlockOffsets[bestPlacement],
-              static_cast<double>(bestResult[12]), static_cast<double>(bestResult[13]),
-              static_cast<double>(bestResult[14]),
-              static_cast<double>(bestScore), indexCount);
+              static_cast<unsigned long long>(probes[i]),
+              static_cast<unsigned long long>(nativePipelineInfo.vertexShaderHash),
+              static_cast<double>(decoded[12]), static_cast<double>(decoded[13]),
+              static_cast<double>(decoded[14]), indexCount);
           }
-          nativePipelineInfo.objectToWorld = bestResult;
+          nativePipelineInfo.objectToWorld = decoded;
           nativePipelineInfo.hasObjectToWorld = true;
           nativePipelineInfo.objectTransformSource = 5;
           nativePipelineInfoPtr = &nativePipelineInfo;
           fusedDecoded = true;
         }
+
+        static std::atomic<uint32_t> missLogs { 0 };
+        if (!fusedDecoded && missLogs.fetch_add(1, std::memory_order_relaxed) < 4) {
+          log("ACZ placement miss: draw=%llu vs=0x%016llx indices=%u probes=%u camera=%u",
+            static_cast<unsigned long long>(count),
+            static_cast<unsigned long long>(nativePipelineInfo.vertexShaderHash),
+            indexCount, probeCount, haveCamera ? 1u : 0u);
+        }
+
+        // Periodic sample so the in-mission state is visible even after the first
+        // few draws have spent the counters above. A draw counter is used rather
+        // than the frame id because a frame id rarely lands on a model draw.
+        static std::atomic<uint32_t> windowLogs { 0 };
+        if (windowLogs.fetch_add(1, std::memory_order_relaxed) % 256 == 0) {
+          log("ACZ placement window: frame=%llu draw=%llu vs=0x%016llx indices=%u probes=%u camera=%u placed=%u",
+            static_cast<unsigned long long>(drawFrame),
+            static_cast<unsigned long long>(count),
+            static_cast<unsigned long long>(nativePipelineInfo.vertexShaderHash),
+            indexCount, probeCount, haveCamera ? 1u : 0u,
+            fusedDecoded ? 1u : 0u);
+        }
       }
     }
-
+    // The structured buffer the model shaders read their transform from is dumped
+    // once, so its layout can be compared with the block the object matrix was
+    // taken from.
+    {
+      static std::atomic<uint32_t> srtDumps { 0 };
+      const uint64_t srtAddress = g_aczSrtBufferAddress.load(std::memory_order_relaxed);
+      if (srtAddress && srtDumps.fetch_add(1, std::memory_order_relaxed) < 2) {
+        std::vector<uint8_t> block;
+        if (readGpuBuffer(srtAddress, 0x1A0, block) && block.size() >= 0x1A0) {
+          log("ACZ srt block: gpu=0x%llx elements=%u",
+            static_cast<unsigned long long>(srtAddress),
+            g_aczSrtBufferElements.load(std::memory_order_relaxed));
+          for (uint32_t row = 0; row < 26; ++row) {
+            const auto* v = reinterpret_cast<const float*>(block.data() + row * 16);
+            log("ACZ srt block +0x%03X: %13.4f %13.4f %13.4f %13.4f",
+              row * 16,
+              static_cast<double>(v[0]), static_cast<double>(v[1]),
+              static_cast<double>(v[2]), static_cast<double>(v[3]));
+          }
+        }
+      }
+    }
     g_perfTransformTicks.fetch_add(
       perfTicks() - transformStartTicks, std::memory_order_relaxed);
     if (captureNativeBinding) {
@@ -2875,6 +3166,136 @@ namespace remix {
           descriptor.capturedSubresources,
           static_cast<unsigned long long>(descriptor.capturedBytes));
         ++loggedDescriptors;
+      }
+    }
+    // Model draws report a placement whose translation is not in world space:
+    // it stays put while the camera crosses the map, so it is encoded relative
+    // to the camera. Three conventions cover how that can be written, and the
+    // draw's own vertices decide between them because only the right one puts
+    // the geometry inside the frustum.
+    D3D12NativePipelineInfo cameraFrameInfo;
+    if (nativePipelineInfoPtr
+     && nativePipelineInfoPtr->hasObjectToWorld
+     && indexCount >= 20
+     && (nativePipelineInfoPtr->objectTransformSource == 2
+      || nativePipelineInfoPtr->objectTransformSource == 4)
+     && placesInCameraRelativeFrame(nativePipelineInfoPtr->vertexShaderHash)) {
+      AczCameraMatrices camera {};
+      if (buildAczCamera(camera)) {
+        const auto& stored = nativePipelineInfoPtr->objectToWorld;
+        const uint64_t shaderHash = nativePipelineInfoPtr->vertexShaderHash;
+        const uint32_t source = nativePipelineInfoPtr->objectTransformSource;
+
+        // The first two vertices of the draw are what the candidates are tested
+        // against, read through the pipeline's own position element because the
+        // models name their attributes ATTRIBUTE0 and up.
+        float vertices[6] = {};
+        uint32_t vertexCount = 0;
+        uint32_t positionOffset = 0;
+        bool hasPosition = false;
+        for (const auto& element : nativePipelineInfoPtr->inputElements) {
+          if (element.slot != 0)
+            continue;
+          std::string semantic = element.semantic;
+          std::transform(semantic.begin(), semantic.end(), semantic.begin(),
+            [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+          if (semantic == "POSITION") {
+            positionOffset = element.offset;
+            hasPosition = true;
+            break;
+          }
+          if (!hasPosition || element.offset < positionOffset) {
+            positionOffset = element.offset;
+            hasPosition = true;
+          }
+        }
+        if (hasPosition && vertexBuffer.StrideInBytes > positionOffset + sizeof(float) * 3) {
+          std::vector<uint8_t> bytes;
+          if (readGpuBuffer(vertexBuffer.BufferLocation,
+                static_cast<size_t>(vertexBuffer.StrideInBytes) * 2, bytes)) {
+            const uint32_t available = static_cast<uint32_t>(
+              bytes.size() / vertexBuffer.StrideInBytes);
+            vertexCount = std::min<uint32_t>(available, 2u);
+            for (uint32_t i = 0; i < vertexCount; ++i) {
+              const auto* position = reinterpret_cast<const float*>(
+                bytes.data() + static_cast<size_t>(i) * vertexBuffer.StrideInBytes
+                + positionOffset);
+              vertices[i * 3 + 0] = position[0];
+              vertices[i * 3 + 1] = position[1];
+              vertices[i * 3 + 2] = position[2];
+            }
+          }
+        }
+
+        const auto inFrustum = [&](const std::array<float, 16>& matrix) {
+          if (vertexCount == 0)
+            return false;
+          float centroidX = 0.0f;
+          float centroidY = 0.0f;
+          for (uint32_t i = 0; i < vertexCount; ++i) {
+            const float* v = &vertices[i * 3];
+            float clip[4] = {};
+            for (uint32_t column = 0; column < 4; ++column) {
+              clip[column] = v[0] * matrix[0 * 4 + column]
+                + v[1] * matrix[1 * 4 + column]
+                + v[2] * matrix[2 * 4 + column]
+                + matrix[3 * 4 + column];
+            }
+            if (clip[3] <= 0.0f)
+              return false;
+            centroidX += clip[0] / clip[3];
+            centroidY += clip[1] / clip[3];
+          }
+          centroidX /= static_cast<float>(vertexCount);
+          centroidY /= static_cast<float>(vertexCount);
+          return std::abs(centroidX) <= 2.0f && std::abs(centroidY) <= 2.0f;
+        };
+        // A: the placement as stored. B: the translation lifted into world
+        // space. C: the translation read in the placement's own basis, then
+        // lifted.
+        std::array<float, 16> placements[3] = { stored, stored, stored };
+        placements[1][12] += camera.eye[0];
+        placements[1][13] += camera.eye[1];
+        placements[1][14] += camera.eye[2];
+        const float basisX = stored[0] * stored[12] + stored[4] * stored[13] + stored[8] * stored[14];
+        const float basisY = stored[1] * stored[12] + stored[5] * stored[13] + stored[9] * stored[14];
+        const float basisZ = stored[2] * stored[12] + stored[6] * stored[13] + stored[10] * stored[14];
+        placements[2][12] = basisX + camera.eye[0];
+        placements[2][13] = basisY + camera.eye[1];
+        placements[2][14] = basisZ + camera.eye[2];
+
+        static const char* const kConventionNames[3] = { "stored", "lifted", "basis" };
+        uint32_t chosen = 3;
+        for (uint32_t i = 0; i < 3; ++i) {
+          if (inFrustum(placements[i])) {
+            chosen = i;
+            break;
+          }
+        }
+        if (chosen < 3) {
+          cameraFrameInfo = *nativePipelineInfoPtr;
+          cameraFrameInfo.objectToWorld = placements[chosen];
+          nativePipelineInfoPtr = &cameraFrameInfo;
+        }
+
+        static std::atomic<uint32_t> frameLogs { 0 };
+        const uint32_t frameLog = frameLogs.fetch_add(1, std::memory_order_relaxed);
+        if (frameLog < 24) {
+          log("ACZ model camera frame: draw=%llu vs=0x%016llx source=%u chosen=%s stored=(%.2f,%.2f,%.2f) lifted=(%.1f,%.1f,%.1f) basis=(%.1f,%.1f,%.1f) eye=(%.1f,%.1f,%.1f) vertices=%u indices=%u",
+            static_cast<unsigned long long>(count),
+            static_cast<unsigned long long>(shaderHash),
+            static_cast<unsigned>(source),
+            chosen < 3 ? kConventionNames[chosen] : "none",
+            static_cast<double>(stored[12]), static_cast<double>(stored[13]),
+            static_cast<double>(stored[14]),
+            static_cast<double>(placements[1][12]), static_cast<double>(placements[1][13]),
+            static_cast<double>(placements[1][14]),
+            static_cast<double>(placements[2][12]), static_cast<double>(placements[2][13]),
+            static_cast<double>(placements[2][14]),
+            static_cast<double>(camera.eye[0]), static_cast<double>(camera.eye[1]),
+            static_cast<double>(camera.eye[2]),
+            vertexCount, indexCount);
+        }
       }
     }
     submitD3D12NativeGeometry(
