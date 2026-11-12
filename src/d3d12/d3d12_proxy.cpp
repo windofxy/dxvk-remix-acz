@@ -64,6 +64,23 @@ namespace remix {
       if (std::strncmp(format, prefix, std::strlen(prefix)) == 0)
         return true;
     }
+
+    // The ACZ probes were investigation scaffolding, so only the placement summary and
+    // the record-carry notice are emitted. Everything else under that prefix is dropped
+    // here rather than at each call site, which keeps the drop list in one place.
+    if (std::strncmp(format, "ACZ ", 4) == 0) {
+      constexpr const char* kAczKeep[] = {
+        "ACZ aircraft:",
+        "ACZ aircraft carry:",
+        "ACZ aircraft mode:",
+        "ACZ aircraft lag:",
+      };
+      for (const char* prefix : kAczKeep) {
+        if (std::strncmp(format, prefix, std::strlen(prefix)) == 0)
+          return false;
+      }
+      return true;
+    }
     return false;
   }
 

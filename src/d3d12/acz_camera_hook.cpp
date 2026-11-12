@@ -49,6 +49,9 @@ namespace remix {
     };
 
     constexpr uint32_t kCameraObjectSlotOffset = 0x300;
+    // The draw context the emitter was handed, stored beside the object it names so a
+    // null object can be told apart from a null argument.
+    constexpr uint32_t kEmitterContextSlotOffset = 0x310;
 
     // Filled by the vertex batch probe; declared here because the snapshot
     // accessor reads it.
@@ -63,6 +66,7 @@ namespace remix {
     uint8_t* g_pDetour = nullptr;
     uint8_t* g_pEmitterTrampoline = nullptr;
     uint8_t* g_pEmitterDetour = nullptr;
+    bool g_emitterInstalled = false;
     bool g_installed = false;
 
     void* findPattern(uint8_t* pStart, size_t size) {
@@ -125,7 +129,6 @@ namespace remix {
         }
       }
       if (!pTarget) {
-        log("ACZ camera hook: emitter signature not found");
         return false;
       }
 
@@ -150,6 +153,10 @@ namespace remix {
 
       emit(pCursor, { 0x48, 0xFF, 0x05 });               // inc qword [rip+disp32]
       emitDisplacement(pCursor, g_pEmitterDetour + kSampleCounterOffset);
+      pCursor += sizeof(int32_t);
+
+      emit(pCursor, { 0x4C, 0x89, 0x05 });               // mov [rip+disp32], r8
+      emitDisplacement(pCursor, g_pEmitterDetour + kEmitterContextSlotOffset);
       pCursor += sizeof(int32_t);
 
       emit(pCursor, { 0x4D, 0x85, 0xC0 });               // test r8, r8
@@ -184,9 +191,6 @@ namespace remix {
       FlushInstructionCache(GetCurrentProcess(), pTarget, kSize);
       FlushInstructionCache(GetCurrentProcess(), g_pEmitterDetour, 4096);
 
-      log("ACZ camera hook: emitter hooked at 0x%llx detour=%p",
-        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(pTarget)),
-        g_pEmitterDetour);
       return true;
     }
 
@@ -206,8 +210,13 @@ namespace remix {
     out.camera = 0;
     if (g_pTransformDetour)
       std::memcpy(out.transformArgs, g_pTransformDetour + kTransformArgsOffset, sizeof(out.transformArgs));
-    if (g_pEmitterDetour)
+    if (g_pEmitterDetour) {
       std::memcpy(&out.camera, g_pEmitterDetour + kCameraObjectSlotOffset, sizeof(out.camera));
+      std::memcpy(&out.emitterContext, g_pEmitterDetour + kEmitterContextSlotOffset,
+        sizeof(out.emitterContext));
+      out.emitterSamples = *reinterpret_cast<const volatile uint64_t*>(
+        g_pEmitterDetour + kSampleCounterOffset);
+    }
     return true;
   }
 
@@ -217,6 +226,10 @@ namespace remix {
     const auto* pCounter = reinterpret_cast<const volatile uint64_t*>(
       g_pTransformDetour + kSampleCounterOffset);
     return *pCounter;
+  }
+
+  bool aczEmitterHookInstalled() {
+    return g_emitterInstalled;
   }
 
   uint32_t readAczTransformCameras(uint64_t out[4]) {
@@ -270,7 +283,6 @@ namespace remix {
         }
       }
       if (!pTarget) {
-        log("ACZ transform probe: signature not found");
         return false;
       }
 
@@ -342,9 +354,6 @@ namespace remix {
       FlushInstructionCache(GetCurrentProcess(), pTarget, kSize);
       FlushInstructionCache(GetCurrentProcess(), g_pTransformDetour, 4096);
 
-      log("ACZ transform probe: hooked at 0x%llx detour=%p",
-        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(pTarget)),
-        g_pTransformDetour);
       return true;
     }
 
@@ -356,7 +365,6 @@ namespace remix {
 
     HMODULE pExe = GetModuleHandleW(nullptr);
     if (!pExe) {
-      log("ACZ camera hook: no executable module");
       return false;
     }
 
@@ -367,7 +375,6 @@ namespace remix {
 
     void* pHookTarget = findPattern(pBase, imageSize);
     if (!pHookTarget) {
-      log("ACZ camera hook: signature not found");
       return false;
     }
 
@@ -379,7 +386,6 @@ namespace remix {
     g_pDetour = static_cast<uint8_t*>(VirtualAlloc(
       nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
     if (!g_pTrampoline || !g_pDetour) {
-      log("ACZ camera hook: allocation failed");
       return false;
     }
 
@@ -421,7 +427,6 @@ namespace remix {
 
     DWORD protection = 0;
     if (!VirtualProtect(pTarget, kPrologueSize, PAGE_EXECUTE_READWRITE, &protection)) {
-      log("ACZ camera hook: VirtualProtect failed error=%lu", GetLastError());
       return false;
     }
 
@@ -436,13 +441,10 @@ namespace remix {
     FlushInstructionCache(GetCurrentProcess(), pTarget, kPrologueSize);
     FlushInstructionCache(GetCurrentProcess(), g_pDetour, 4096);
 
-    installEmitterHook(pBase, imageSize);
+    g_emitterInstalled = installEmitterHook(pBase, imageSize);
     installTransformProbe(pBase, imageSize);
 
     g_installed = true;
-    log("ACZ camera hook: installed target=0x%llx detour=%p trampoline=%p",
-      static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(pTarget)),
-      g_pDetour, g_pTrampoline);
     return true;
   }
 

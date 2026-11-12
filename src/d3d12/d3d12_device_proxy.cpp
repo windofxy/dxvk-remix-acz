@@ -139,6 +139,17 @@ namespace remix {
       return S_OK;
     }
 
+    // Handing out the real device for a higher interface bypasses every hook in
+    // this layer: the caller then creates buffers and their views through methods
+    // this proxy never sees, so those buffers never reach the address registry.
+    // Refusing the higher interfaces makes the caller fall back to ID3D12Device2,
+    // which this proxy implements, so creation stays observable.
+    if (riid == __uuidof(ID3D12Device3) || isDevice4OrLaterIid(riid)) {
+      log("ID3D12Device::QueryInterface(riid=%s) refused so creation stays proxied",
+        formatIid(riid));
+      return E_NOINTERFACE;
+    }
+
     HRESULT result = m_device->QueryInterface(riid, ppvObject);
     bool traceSupported = isDevice4OrLaterIid(riid);
     bool traceInstalled = false;

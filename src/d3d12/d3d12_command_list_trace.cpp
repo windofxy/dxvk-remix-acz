@@ -427,6 +427,7 @@ namespace remix {
       auto function = reinterpret_cast<void (STDMETHODCALLTYPE*)(
         ID3D12GraphicsCommandList*, ID3D12Resource*, UINT64,
         ID3D12Resource*, UINT64, UINT64)>(entry->copyBufferRegion);
+      recordCopyBufferRegion(destination, destinationOffset, source, sourceOffset, numBytes);
       function(commandList, destination, destinationOffset, source, sourceOffset, numBytes);
     }
 
@@ -456,6 +457,8 @@ namespace remix {
       auto* entry = findEntry(commandList);
       auto function = reinterpret_cast<void (STDMETHODCALLTYPE*)(
         ID3D12GraphicsCommandList*, ID3D12Resource*, ID3D12Resource*)>(entry->copyResource);
+      recordCopyBufferRegion(destination, 0, source, 0,
+        std::min(destination->GetDesc().Width, source->GetDesc().Width));
       function(commandList, destination, source);
     }
 
@@ -594,12 +597,12 @@ namespace remix {
         ID3D12GraphicsCommandList*, UINT, D3D12_GPU_DESCRIPTOR_HANDLE)>(entry->setGraphicsRootDescriptorTable);
       if (rootParameterIndex < ARRAYSIZE(entry->currentGraphicsDescriptorTables))
         entry->currentGraphicsDescriptorTables[rootParameterIndex] = baseDescriptor;
+      if (rootParameterIndex >= ARRAYSIZE(entry->currentGraphicsDescriptorTables) && baseDescriptor.ptr)
+        log("ACZ tbl hi: index=%u gpu=0x%llx", rootParameterIndex, static_cast<unsigned long long>(baseDescriptor.ptr));
       {
         static uint32_t tableLogs = 0;
         if (baseDescriptor.ptr && tableLogs < 16) {
           ++tableLogs;
-          log("ACZ root table: index=%u gpu=0x%llx",
-            rootParameterIndex, static_cast<unsigned long long>(baseDescriptor.ptr));
         }
       }
       log("ID3D12GraphicsCommandList::SetGraphicsRootDescriptorTable(index=%u, gpu=0x%llx)",
@@ -665,12 +668,12 @@ namespace remix {
         ID3D12GraphicsCommandList*, UINT, D3D12_GPU_VIRTUAL_ADDRESS)>(entry->setGraphicsRootShaderResourceView);
       if (rootParameterIndex < ARRAYSIZE(entry->currentGraphicsRootSrvs))
         entry->currentGraphicsRootSrvs[rootParameterIndex] = bufferLocation;
+      if (rootParameterIndex >= ARRAYSIZE(entry->currentGraphicsRootSrvs) && bufferLocation)
+        log("ACZ srv hi: index=%u gpu=0x%llx", rootParameterIndex, static_cast<unsigned long long>(bufferLocation));
       {
         static uint32_t rootSrvLogs = 0;
         if (bufferLocation && rootSrvLogs < 16) {
           ++rootSrvLogs;
-          log("ACZ root SRV: index=%u gpu=0x%llx",
-            rootParameterIndex, static_cast<unsigned long long>(bufferLocation));
         }
       }
       log("ID3D12GraphicsCommandList::SetGraphicsRootShaderResourceView(index=%u, gpu=0x%llx)",

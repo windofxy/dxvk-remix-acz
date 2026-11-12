@@ -122,17 +122,7 @@ namespace remix {
         return;
       const uint64_t value = g_aircraftStages[stage].fetch_add(
         1, std::memory_order_relaxed) + 1;
-      if (stage == kAircraftDraw && (value % 512) == 0) {
-        log("ACZ aircraft verdict: draws=%llu submitted=%llu gated=%llu topology=%llu unreadable=%llu identity=%llu noTransform=%llu apiRejected=%llu",
-          static_cast<unsigned long long>(g_aircraftStages[kAircraftDraw].load(std::memory_order_relaxed)),
-          static_cast<unsigned long long>(g_aircraftStages[kAircraftSubmitted].load(std::memory_order_relaxed)),
-          static_cast<unsigned long long>(g_aircraftStages[kAircraftGated].load(std::memory_order_relaxed)),
-          static_cast<unsigned long long>(g_aircraftStages[kAircraftTopology].load(std::memory_order_relaxed)),
-          static_cast<unsigned long long>(g_aircraftStages[kAircraftUnreadable].load(std::memory_order_relaxed)),
-          static_cast<unsigned long long>(g_aircraftStages[kAircraftIdentity].load(std::memory_order_relaxed)),
-          static_cast<unsigned long long>(g_aircraftStages[kAircraftNoTransform].load(std::memory_order_relaxed)),
-          static_cast<unsigned long long>(g_aircraftStages[kAircraftApiRejected].load(std::memory_order_relaxed)));
-      }
+
     }
 
     std::atomic<uint64_t> g_nativeReadFailures { 0 };
@@ -1295,7 +1285,12 @@ namespace remix {
       // decoded yet; see acz-model-transform.md. Such draws are dropped rather
       // than piled at the world origin.
       constexpr bool kAcceptIdentityAsWorldSpace = false;
-      if (identityTransform && !worldSpaceCandidate && !kAcceptIdentityAsWorldSpace) {
+      // A draw this layer placed itself carries a real world position, so an
+      // identity rotation means the camera simply looks down a world axis and the
+      // draw must still be submitted.
+      const bool placedHere = pipelineInfo->objectTransformSource == 8;
+      if (identityTransform && !worldSpaceCandidate && !kAcceptIdentityAsWorldSpace
+       && !placedHere) {
         logBridgeStageOnce("instance identity");
         g_nativeIdentityFiltered.fetch_add(1, std::memory_order_relaxed);
         noteAircraftDraw(pipelineInfo->vertexShaderHash, kAircraftIdentity);
@@ -1364,6 +1359,30 @@ namespace remix {
           m[4], m[5], m[6], m[7],
           m[8], m[9], m[10], m[11],
           m[12], m[13], m[14], m[15]);
+        // The matrix Remix actually receives for the draw this layer placed. Every
+        // earlier attempt changed the matrix on the adapter side without ever
+        // confirming this value, so this is the first measurement of it.
+        if (pipelineInfo->objectTransformSource == 8) {
+          static float lastSubmitted[12] = {};
+          const float current[12] = { m[0], m[1], m[2], m[4], m[5], m[6],
+                                      m[8], m[9], m[10], m[12], m[13], m[14] };
+          bool changed = false;
+          for (uint32_t index = 0; index < 12; ++index)
+            changed = changed || current[index] != lastSubmitted[index];
+          if (changed) {
+            for (uint32_t index = 0; index < 12; ++index)
+              lastSubmitted[index] = current[index];
+            log("ACZ submit: t=(%.2f,%.2f,%.2f) r0=(%.4f,%.4f,%.4f) r1=(%.4f,%.4f,%.4f) r2=(%.4f,%.4f,%.4f)",
+              static_cast<double>(m[12]), static_cast<double>(m[13]),
+              static_cast<double>(m[14]),
+              static_cast<double>(m[0]), static_cast<double>(m[1]),
+              static_cast<double>(m[2]),
+              static_cast<double>(m[4]), static_cast<double>(m[5]),
+              static_cast<double>(m[6]),
+              static_cast<double>(m[8]), static_cast<double>(m[9]),
+              static_cast<double>(m[10]));
+          }
+        }
       } else {
         state->drawCall.modifyTransformData().objectToWorld = dxvk::Matrix4();
       }
@@ -1385,13 +1404,6 @@ namespace remix {
           const float dx = m[12] - g_cameraEye.x;
           const float dy = m[13] - g_cameraEye.y;
           const float dz = m[14] - g_cameraEye.z;
-          log("ACZ instance: draw=%llu vs=0x%016llx t=(%.2f,%.2f,%.2f) eyeDistance=%.1f indices=%u stride=%u",
-            static_cast<unsigned long long>(pipelineInfo->drawId),
-            static_cast<unsigned long long>(pipelineInfo->vertexShaderHash),
-            static_cast<double>(m[12]), static_cast<double>(m[13]),
-            static_cast<double>(m[14]),
-            static_cast<double>(std::sqrt(dx * dx + dy * dy + dz * dz)),
-            pipelineInfo->indexCount, pipelineInfo->vertexBufferStride);
         }
       }
         if (worldSpaceCandidate)
@@ -1416,19 +1428,7 @@ namespace remix {
         static NearestAirframe nearest;
         const uint32_t frame = g_device.ptr() ? g_device->getCurrentFrameId() : 0u;
         if (frame != nearest.frame) {
-          if (nearest.draw) {
-            log("ACZ nearest airframe: frame=%u draw=%llu accepted=%u t=(%.2f,%.2f,%.2f) eye=(%.1f,%.1f,%.1f) eyeDistance=%.1f indices=%u",
-              nearest.frame,
-              static_cast<unsigned long long>(nearest.draw),
-              nearest.accepted,
-              static_cast<double>(nearest.position[0]),
-              static_cast<double>(nearest.position[1]),
-              static_cast<double>(nearest.position[2]),
-              static_cast<double>(g_cameraEye.x), static_cast<double>(g_cameraEye.y),
-              static_cast<double>(g_cameraEye.z),
-              static_cast<double>(nearest.distance),
-              nearest.indices);
-          }
+
           nearest = {};
           nearest.frame = frame;
         }
@@ -1461,16 +1461,6 @@ namespace remix {
               const auto* v0 = reinterpret_cast<const float*>(bytes.data());
               const auto* v1 = reinterpret_cast<const float*>(
                 bytes.data() + pipelineInfo->vertexBufferStride);
-              log("ACZ airframe vertices: draw=%llu stride=%u v0=(%.2f,%.2f,%.2f) v1=(%.2f,%.2f,%.2f) appliedT=(%.2f,%.2f,%.2f)",
-                static_cast<unsigned long long>(pipelineInfo->drawId),
-                pipelineInfo->vertexBufferStride,
-                static_cast<double>(v0[0]), static_cast<double>(v0[1]),
-                static_cast<double>(v0[2]),
-                static_cast<double>(v1[0]), static_cast<double>(v1[1]),
-                static_cast<double>(v1[2]),
-                static_cast<double>(pipelineInfo->objectToWorld[12]),
-                static_cast<double>(pipelineInfo->objectToWorld[13]),
-                static_cast<double>(pipelineInfo->objectToWorld[14]));
             }
           }
         }
@@ -1487,17 +1477,8 @@ namespace remix {
             std::vector<uint8_t> block;
             if (readGpuBuffer(pipelineInfo->objectTransformCbv, 0x1A0, block)
              && block.size() >= 0x1A0) {
-              log("ACZ airframe block: frame=%u draw=%llu cbv=0x%llx eye=(%.1f,%.1f,%.1f)",
-                frame, static_cast<unsigned long long>(pipelineInfo->drawId),
-                static_cast<unsigned long long>(pipelineInfo->objectTransformCbv),
-                static_cast<double>(g_cameraEye.x), static_cast<double>(g_cameraEye.y),
-                static_cast<double>(g_cameraEye.z));
               for (uint32_t row = 0; row < 26; ++row) {
                 const auto* v = reinterpret_cast<const float*>(block.data() + row * 16);
-                log("ACZ airframe block +0x%03X: %13.4f %13.4f %13.4f %13.4f",
-                  row * 16,
-                  static_cast<double>(v[0]), static_cast<double>(v[1]),
-                  static_cast<double>(v[2]), static_cast<double>(v[3]));
               }
             }
           }
@@ -1699,14 +1680,6 @@ namespace remix {
         static uint32_t drawParamLogs = 0;
         if (drawParamLogs < 10 && pipelineInfo->indexCount >= 1000) {
           ++drawParamLogs;
-          log("ACZ draw params: baseVertex=%d startIndex=%u indexCount=%u stride=%u ibFormat=%u vbLoc=0x%llx vbSize=%llu",
-            pipelineInfo->baseVertexLocation,
-            pipelineInfo->startIndexLocation,
-            pipelineInfo->indexCount,
-            pipelineInfo->vertexBufferStride,
-            static_cast<unsigned>(pipelineInfo->indexBufferFormat),
-            static_cast<unsigned long long>(pipelineInfo->vertexBufferLocation),
-            static_cast<unsigned long long>(pipelineInfo->vertexBufferSize));
         }
       }
       g_meshStorage.push_back({ handle, vertexBuffer, indexBuffer });
@@ -2014,6 +1987,20 @@ namespace remix {
       static_cast<double>(view[3][2]));
   }
 
+  bool readD3D12CameraMatrices(float worldToView[16], float eye[3]) {
+    std::lock_guard lock(g_backendMutex);
+    if (!g_hasCameraMatrices)
+      return false;
+    for (uint32_t row = 0; row < 4; ++row) {
+      for (uint32_t column = 0; column < 4; ++column)
+        worldToView[row * 4 + column] = g_cameraWorldToView[row][column];
+    }
+    eye[0] = g_cameraEye.x;
+    eye[1] = g_cameraEye.y;
+    eye[2] = g_cameraEye.z;
+    return true;
+  }
+
   void setD3D12OutputEnabled(bool enabled) {
     g_remixOutputEnabled.store(enabled, std::memory_order_relaxed);
     log("D3D12 native Remix output toggled: enabled=%u", enabled ? 1u : 0u);
@@ -2051,7 +2038,6 @@ namespace remix {
     if (whiteKeyDown && !g_whiteMaterialKeyDown) {
       const bool enabled = g_forceWhiteMaterials.load(std::memory_order_relaxed) == 0;
       g_forceWhiteMaterials.store(enabled ? 1u : 0u, std::memory_order_relaxed);
-      log("ACZ white model materials: enabled=%u", enabled ? 1u : 0u);
     }
     g_whiteMaterialKeyDown = whiteKeyDown;
 
@@ -2238,12 +2224,6 @@ namespace remix {
           g_nativeNearestInstanceDistanceSq.exchange(3.4e38f, std::memory_order_relaxed));
         const uint32_t nearInstances =
           g_nativeNearInstances.exchange(0, std::memory_order_relaxed);
-        log("ACZ instance distance window: eye=(%.1f,%.1f,%.1f) nearest=%.1f nearInstances=%u",
-          static_cast<double>(g_cameraEye.x),
-          static_cast<double>(g_cameraEye.y),
-          static_cast<double>(g_cameraEye.z),
-          static_cast<double>(nearestSq),
-          nearInstances);
       }
       auto& windowSceneManager = g_device->getCommon()->getSceneManager();
       log("D3D12 native scene window: meshes=%llu instances=%u surfaces=%u",

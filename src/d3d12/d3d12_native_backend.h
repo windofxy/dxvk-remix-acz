@@ -119,6 +119,10 @@ namespace remix {
       const float* worldToView,
       const float* viewToProjection);
 
+  // Camera the scene is actually rendered with, in the same row-vector form the
+  // matrices were handed to Remix. Returns false until one has been submitted.
+  bool readD3D12CameraMatrices(float worldToView[16], float eye[3]);
+
   // Enables or disables the Remix output path. Disabled output leaves the
   // native D3D12 frame on screen while capture keeps running.
   // Reports the bounds of the transforms submitted since the process started.

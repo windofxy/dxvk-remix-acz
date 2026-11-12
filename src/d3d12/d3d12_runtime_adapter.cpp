@@ -1145,14 +1145,6 @@ namespace remix {
       cpuStart, gpuStart, increment, description.NumDescriptors, description.Type };
     // The heap ranges are what lets a draw's descriptor be read straight out of
     // host memory, so they are logged under a prefix that is never filtered.
-    log("ACZ heap: heap=%p type=%u count=%u flags=0x%x cpu=0x%llx gpu=0x%llx increment=%u",
-      heap,
-      static_cast<unsigned>(description.Type),
-      description.NumDescriptors,
-      description.Flags,
-      static_cast<unsigned long long>(cpuStart.ptr),
-      static_cast<unsigned long long>(gpuStart.ptr),
-      increment);
   }
 
   void recordD3D12View(
@@ -1222,15 +1214,7 @@ namespace remix {
           }
           static std::atomic<uint32_t> bufferSrvLogs { 0 };
           const uint32_t index = bufferSrvLogs.fetch_add(1, std::memory_order_relaxed);
-          if (index < 24) {
-            log("ACZ buffer SRV: cpu=0x%llx gpu=0x%llx stride=%u elements=%u first=%llu width=%llu",
-              static_cast<unsigned long long>(cpuHandle.ptr),
-              static_cast<unsigned long long>(metadata.resourceGpuAddress),
-              effectiveStride,
-              srv->Buffer.NumElements,
-              static_cast<unsigned long long>(srv->Buffer.FirstElement),
-              static_cast<unsigned long long>(resourceDesc.Width));
-          }
+
         }
       } else {
         UINT mostDetailedMip = 0;
@@ -1474,32 +1458,13 @@ namespace remix {
   std::atomic<uint32_t> g_cameraDepthReversed { 1 };
   std::atomic<uint32_t> g_cameraFlipVertical { 1 };
 
-  void pollCameraConventionKeys() {
-    static bool depthKeyDown = false;
-    static bool verticalKeyDown = false;
-
-    const bool depthKey = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-    if (depthKey && !depthKeyDown) {
-      const bool reversed = g_cameraDepthReversed.load(std::memory_order_relaxed) != 0;
-      g_cameraDepthReversed.store(reversed ? 0u : 1u, std::memory_order_relaxed);
-      log("ACZ camera convention: depth row=%s",
-        reversed ? "third row forward" : "third row backward");
-    }
-    depthKeyDown = depthKey;
-
-    const bool verticalKey = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-    if (verticalKey && !verticalKeyDown) {
-      const bool flipped = g_cameraFlipVertical.load(std::memory_order_relaxed) != 0;
-      g_cameraFlipVertical.store(flipped ? 0u : 1u, std::memory_order_relaxed);
-      log("ACZ camera convention: vertical scale=%s",
-        flipped ? "negative" : "positive");
-    }
-    verticalKeyDown = verticalKey;
-  }
-
-  struct AczCameraMatrices {
-    std::array<float, 16> view {};
+  struct AczCameraMatrices {    std::array<float, 16> view {};
     std::array<float, 16> projection {};
+    // The projection the scene is rasterised with, which stores clip coordinates
+    // offset by half the viewport. Transform records carry positions in this
+    // space, so converting one back to world needs this matrix, not the clean one.
+    std::array<float, 16> displayProjection {};
+    bool hasDisplayProjection = false;
     float eye[3] {};
     float third[3] {};
     float nearPlane = 0.0f;
@@ -1542,26 +1507,54 @@ namespace remix {
      || !std::isfinite(forwardLength) || forwardLength < 0.5f)
       return false;
 
-    // One-off dump of the whole block so the basis and depth conventions can
-    // be settled from a single run.
+    // The aircraft's own world position lives in the scene node that shares this
+    // object: the node sits at block + 0x7B8 and its position at node + 0x258,
+    // which is block + 0xA10. Reported on change so it can be held against the
+    // position this layer reconstructs from the record.
     {
-      static uint32_t blockDumps = 0;
+      const auto* pPosition = reinterpret_cast<const float*>(
+        reinterpret_cast<const uint8_t*>(pCamera) + 0xA10);
+      MEMORY_BASIC_INFORMATION positionInfo {};
+      if (VirtualQuery(pPosition, &positionInfo, sizeof(positionInfo))
+       && positionInfo.State == MEM_COMMIT
+       && reinterpret_cast<uintptr_t>(pPosition) + 4 * sizeof(float)
+          <= reinterpret_cast<uintptr_t>(positionInfo.BaseAddress) + positionInfo.RegionSize) {
+        static float lastPosition[4] = {};
+        bool changed = false;
+        for (uint32_t index = 0; index < 4; ++index)
+          changed = changed || pPosition[index] != lastPosition[index];
+        if (changed) {
+          for (uint32_t index = 0; index < 4; ++index)
+            lastPosition[index] = pPosition[index];
+          log("ACZ node position: p=(%.3f,%.3f,%.3f) w=%.3f",
+            static_cast<double>(pPosition[0]), static_cast<double>(pPosition[1]),
+            static_cast<double>(pPosition[2]), static_cast<double>(pPosition[3]));
+        }
+      }
+    }
+
+    // One dump of the whole camera block per distinct block address, so a field
+    // that already holds the aircraft position or a reference scale can be found
+    // without guessing at offsets.
+    {
+      static uintptr_t dumpedCamera = 0;
       const auto* pFull = reinterpret_cast<const uint8_t*>(pCamera);
       MEMORY_BASIC_INFORMATION fullInfo {};
-      if (blockDumps < 2
+      if (reinterpret_cast<uintptr_t>(pFull) != dumpedCamera
        && VirtualQuery(pFull, &fullInfo, sizeof(fullInfo))
        && fullInfo.State == MEM_COMMIT
        && reinterpret_cast<uintptr_t>(pFull) + 0x120
           <= reinterpret_cast<uintptr_t>(fullInfo.BaseAddress) + fullInfo.RegionSize) {
-        ++blockDumps;
+        dumpedCamera = reinterpret_cast<uintptr_t>(pFull);
         float full[72] = {};
         std::memcpy(full, pFull, sizeof(full));
+        log("ACZ camera block: ptr=0x%llx eye=(%.2f,%.2f,%.2f)",
+          static_cast<unsigned long long>(dumpedCamera),
+          static_cast<double>(eyeX), static_cast<double>(eyeY), static_cast<double>(eyeZ));
         for (uint32_t row = 0; row < 18; ++row) {
-          log("ACZ flight block +0x%03X: %13.4f %13.4f %13.4f %13.4f", row * 16,
-            static_cast<double>(full[row * 4 + 0]),
-            static_cast<double>(full[row * 4 + 1]),
-            static_cast<double>(full[row * 4 + 2]),
-            static_cast<double>(full[row * 4 + 3]));
+          log("ACZ camera block +0x%03X: %11.4f %11.4f %11.4f %11.4f", row * 16,
+            static_cast<double>(full[row * 4 + 0]), static_cast<double>(full[row * 4 + 1]),
+            static_cast<double>(full[row * 4 + 2]), static_cast<double>(full[row * 4 + 3]));
         }
       }
     }
@@ -1659,7 +1652,7 @@ namespace remix {
     // positive in front.
     const bool depthReversed = g_cameraDepthReversed.load(std::memory_order_relaxed) != 0;
     const float depthSign = depthReversed ? -1.0f : 1.0f;
-    const float verticalSign =
+    float verticalSign =
       g_cameraFlipVertical.load(std::memory_order_relaxed) != 0 ? 1.0f : -1.0f;
     const float p22 = farPlane / (farPlane - nearPlane);
     const float pB = -nearPlane * p22;
@@ -1676,6 +1669,29 @@ namespace remix {
     out.p11 = p11;
     out.depthSign = depthSign;
     out.verticalSign = verticalSign;
+
+    // The rasterising projection sits right before the clean one. Its two
+    // diagonal terms and its third row carry the half viewport offsets that the
+    // object records use, so it is what turns a record position into a world one.
+    {
+      const auto* pDisplayBytes = reinterpret_cast<const uint8_t*>(pCamera) + 0x90;
+      MEMORY_BASIC_INFORMATION displayInfo {};
+      if (VirtualQuery(pDisplayBytes, &displayInfo, sizeof(displayInfo))
+       && displayInfo.State == MEM_COMMIT
+       && reinterpret_cast<uintptr_t>(pDisplayBytes) + sizeof(out.displayProjection)
+          <= reinterpret_cast<uintptr_t>(displayInfo.BaseAddress) + displayInfo.RegionSize) {
+        std::memcpy(out.displayProjection.data(), pDisplayBytes, sizeof(out.displayProjection));
+        bool displayFinite = true;
+        for (float value : out.displayProjection)
+          displayFinite = displayFinite && std::isfinite(value);
+        // A projection has a scale on its first two rows and a negated depth term
+        // in the third, which tells it apart from whatever else follows the block.
+        out.hasDisplayProjection = displayFinite
+          && std::abs(out.displayProjection[0]) > 0.1f
+          && std::abs(out.displayProjection[5]) > 0.1f
+          && std::abs(out.displayProjection[11] + 1.0f) < 0.1f;
+      }
+    }
     return true;
   }
 
@@ -1789,10 +1805,7 @@ namespace remix {
     const auto reject = [](FusedRejectReason reason) {
       static std::atomic<uint32_t> counters[kFusedRejectReasonCount];
       const uint32_t count = counters[reason].fetch_add(1, std::memory_order_relaxed);
-      if (count < 4) {
-        log("ACZ fused model transform rejected: reason=%s count=%u",
-          fusedReasonText(reason), count + 1);
-      }
+
       return false;
     };
 
@@ -1846,17 +1859,6 @@ namespace remix {
         const float originX = std::abs(originW) > 1.0e-6f ? modelToClip[12] / originW : 0.0f;
         const float originY = std::abs(originW) > 1.0e-6f ? modelToClip[13] / originW : 0.0f;
 
-        log("ACZ fused model transform: sample=%u t=(%.3f,%.3f,%.3f) translation=%.1f rows=(%.4f,%.4f,%.4f) det=%.4f originW=%.4f originNdc=(%.3f,%.3f) maxError=%.3g",
-          index,
-          static_cast<double>(result[12]),
-          static_cast<double>(result[13]),
-          static_cast<double>(result[14]),
-          static_cast<double>(translationLength),
-          static_cast<double>(row0), static_cast<double>(row1), static_cast<double>(row2),
-          static_cast<double>(determinant),
-          static_cast<double>(originW),
-          static_cast<double>(originX), static_cast<double>(originY),
-          static_cast<double>(worstError));
 
         if (index < 2) {
           // The draw buffer holds one element per object, so the shader may pick
@@ -1869,18 +1871,10 @@ namespace remix {
             if (readGpuBuffer(constantsAddress, sizeof(uint32_t) * 4, constants)
              && constants.size() >= sizeof(uint32_t) * 2) {
               const auto* words = reinterpret_cast<const uint32_t*>(constants.data());
-              log("ACZ fused model constant: root=%u address=0x%llx words=(%u,%u,%u,%u)",
-                slot, static_cast<unsigned long long>(constantsAddress),
-                words[0], words[1], words[2], words[3]);
             }
           }
 
           for (uint32_t row = 0; row < 4; ++row) {
-            log("ACZ fused model M0 r%u: %12.5f %12.5f %12.5f %12.5f", row,
-              static_cast<double>(modelToClip[row * 4 + 0]),
-              static_cast<double>(modelToClip[row * 4 + 1]),
-              static_cast<double>(modelToClip[row * 4 + 2]),
-              static_cast<double>(modelToClip[row * 4 + 3]));
           }
         }
 
@@ -1900,13 +1894,6 @@ namespace remix {
                 remixClip[column] += vertex[row] * remixComposed[row * 4 + column];
               }
             }
-            log("ACZ fused model check: v=(%.3f,%.3f,%.3f) gameClip=(%.4f,%.4f,%.4f,%.4f) remixClip=(%.4f,%.4f,%.4f,%.4f)",
-              static_cast<double>(vertex[0]), static_cast<double>(vertex[1]),
-              static_cast<double>(vertex[2]),
-              static_cast<double>(gameClip[0]), static_cast<double>(gameClip[1]),
-              static_cast<double>(gameClip[2]), static_cast<double>(gameClip[3]),
-              static_cast<double>(remixClip[0]), static_cast<double>(remixClip[1]),
-              static_cast<double>(remixClip[2]), static_cast<double>(remixClip[3]));
           }
         }
       }
@@ -2050,109 +2037,6 @@ namespace remix {
   // transform data from a structured buffer that the draw trace cannot map onto a
   // root parameter, so the bound tables are scanned instead and the views are
   // validated by content rather than by binding.
-  void collectDrawBufferCandidates(
-      const D3D12_GPU_DESCRIPTOR_HANDLE* tables,
-      uint64_t drawId,
-      std::vector<D3D12_GPU_VIRTUAL_ADDRESS>& addresses,
-      std::vector<UINT64>& widths) {
-    if (!tables)
-      return;
-
-    // The transform buffers sit past the texture range of the first table, which
-    // already holds more than sixteen views.
-    constexpr uint32_t kDescriptorOffsets = 96;
-    constexpr uint32_t kMaxCandidates = 16;
-    constexpr size_t kMaxTables = 8;
-
-    static std::atomic<uint32_t> reports { 0 };
-    const bool report = reports.fetch_add(1, std::memory_order_relaxed) < 2;
-
-    std::lock_guard lock(g_frameMutex);
-    for (size_t table = 0; table < kMaxTables && addresses.size() < kMaxCandidates; ++table) {
-      const uint64_t tableGpu = tables[table].ptr;
-      if (!tableGpu)
-        continue;
-
-      const DescriptorHeapMetadata* heap = nullptr;
-      for (const auto& entry : g_descriptorHeaps) {
-        const auto& metadata = entry.second;
-        if (!metadata.gpuStart.ptr || !metadata.increment || tableGpu < metadata.gpuStart.ptr)
-          continue;
-        const uint64_t delta = tableGpu - metadata.gpuStart.ptr;
-        if (delta % metadata.increment)
-          continue;
-        if (delta / metadata.increment >= metadata.count)
-          continue;
-        heap = &metadata;
-        break;
-      }
-      if (!heap)
-        continue;
-
-      for (uint32_t offset = 0; offset < kDescriptorOffsets && addresses.size() < kMaxCandidates; ++offset) {
-        const uint64_t descriptorGpu = tableGpu + static_cast<uint64_t>(offset) * heap->increment;
-        const uint64_t descriptorDelta = descriptorGpu - heap->gpuStart.ptr;
-        if (descriptorDelta % heap->increment)
-          continue;
-        const uint64_t index = descriptorDelta / heap->increment;
-        if (index >= heap->count)
-          break;
-        const uint64_t cpu = heap->cpuStart.ptr + index * heap->increment;
-        const auto descriptor = g_descriptors.find(cpu);
-        if (descriptor == g_descriptors.end())
-          continue;
-
-        const DescriptorMetadata& metadata = descriptor->second;
-        D3D12_GPU_VIRTUAL_ADDRESS address = 0;
-        UINT64 width = 0;
-        const char* kind = nullptr;
-        if (metadata.viewType && std::strcmp(metadata.viewType, "CBV") == 0) {
-          address = metadata.bufferLocation;
-          width = metadata.bufferSize ? metadata.bufferSize : 0x1000;
-          kind = "cbv";
-        } else if (metadata.viewType && std::strcmp(metadata.viewType, "SRV") == 0
-                && metadata.resource
-                && metadata.resourceDescription.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-          address = metadata.resourceGpuAddress;
-          width = metadata.resourceDescription.Width;
-          kind = "srv";
-        }
-        if (!address || width < 0x40)
-          continue;
-
-        bool duplicate = false;
-        for (const auto existing : addresses) {
-          if (existing == address) {
-            duplicate = true;
-            break;
-          }
-        }
-        if (duplicate)
-          continue;
-
-        addresses.push_back(address);
-        widths.push_back(width);
-        if (!report)
-          continue;
-        log("ACZ draw buffer candidate: draw=%llu table=%zu offset=%u kind=%s gpu=0x%llx width=%llu",
-          drawId, table, offset, kind,
-          static_cast<unsigned long long>(address),
-          static_cast<unsigned long long>(width));
-        for (uint32_t row = 0; row < 2; ++row) {
-          std::vector<uint8_t> bytes;
-          if (!readGpuBuffer(address + row * 0x100, 16, bytes) || bytes.size() < 16) {
-            log("ACZ draw buffer candidate +0x%03X: unreadable", row * 0x100);
-            continue;
-          }
-          const auto* values = reinterpret_cast<const float*>(bytes.data());
-          log("ACZ draw buffer candidate +0x%03X: %12.5g %12.5g %12.5g %12.5g", row * 0x100,
-            static_cast<double>(values[0]), static_cast<double>(values[1]),
-            static_cast<double>(values[2]), static_cast<double>(values[3]));
-        }
-      }
-    }
-  }
-
   // Decodes one already-read matrix into a placement. Silent, so several
   // candidates can be tried in one draw.
   bool composeFusedMatrix(
@@ -2197,148 +2081,952 @@ namespace remix {
     return composeFusedMatrix(modelToClip, objectToWorld, result);
   }
 
-  // The model record is read through a single descriptor of an SRV table as a
-  // 26-element typed buffer, so the descriptor names the record itself: its byte
-  // size is the record size and it carries no structure stride. Only the
-  // descriptor words are read, which costs one read per table slot.
-  // Reports the descriptor words of a model draw's tables, so the record view is
-  // read from the descriptors rather than inferred from a failed match. Bounded
-  // to three draws and sixteen slots per table.
-  void logModelDescriptorSlots(
-      const D3D12_GPU_DESCRIPTOR_HANDLE* tables,
-      uint64_t drawId) {
-    static std::atomic<uint32_t> dumps { 0 };
-    if (dumps.fetch_add(1, std::memory_order_relaxed) >= 3 || !tables)
-      return;
+  // Tracks which records the t10 probe has already reported. The game cycles
+  // through a handful of records, so remembering only the previous address would
+  // re-report every draw; this keeps one line per distinct record instead.
+  struct RecordState {
+    bool described = false;
+    bool readable = false;
+  };
 
-    std::lock_guard lock(g_frameMutex);
-    for (size_t table = 0; table < 8; ++table) {
-      const uint64_t tableGpu = tables[table].ptr;
-      if (!tableGpu)
-        continue;
+  constexpr size_t kReportedRecordLimit = 8192;
+  std::unordered_map<D3D12_GPU_VIRTUAL_ADDRESS, RecordState> g_recordStates;
 
-      const DescriptorHeapMetadata* heap = nullptr;
-      for (const auto& entry : g_descriptorHeaps) {
-        const auto& metadata = entry.second;
-        if (!metadata.gpuStart.ptr || !metadata.increment || tableGpu < metadata.gpuStart.ptr)
-          continue;
-        const uint64_t delta = tableGpu - metadata.gpuStart.ptr;
-        if (delta % metadata.increment || delta / metadata.increment >= metadata.count)
-          continue;
-        heap = &metadata;
-        break;
-      }
-      if (!heap)
-        continue;
+  // Descriptor tables already scanned for the slot that carries the record, and
+  // descriptor handles already reported. Both keep the probes to one line per
+  // table rather than one line per draw.
+  std::unordered_set<uint64_t> g_scannedTables;
+  std::unordered_set<uint64_t> g_reportedDescriptors;
 
-      const uint64_t baseIndex = (tableGpu - heap->gpuStart.ptr) / heap->increment;
-      for (uint32_t slot = 0; slot < 16; ++slot) {
-        const uint64_t index = baseIndex + slot;
-        if (index >= heap->count)
-          break;
-        const uint64_t cpu = heap->cpuStart.ptr + index * heap->increment;
+  // World position of the player aircraft rebuilt from its transform record.
+  // While it is valid the placement below uses it and leaves the camera rig alone.
+  std::atomic<bool> g_recordWorldValid { false };
+  std::atomic<bool> g_recordWorldReported { false };
+  float g_recordWorld[3] = { 0.0f, 0.0f, 0.0f };
 
-        uint64_t bufferLocation = 0;
-        uint32_t bufferSize = 0;
-        uint32_t structureStride = 0;
-        std::memcpy(&bufferLocation, reinterpret_cast<const void*>(cpu), sizeof(bufferLocation));
-        std::memcpy(&bufferSize, reinterpret_cast<const void*>(cpu + 8), sizeof(bufferSize));
-        std::memcpy(&structureStride, reinterpret_cast<const void*>(cpu + 12),
-          sizeof(structureStride));
-        if (bufferLocation < 0x100000000ull || bufferLocation > 0x7fffffffffffull)
-          continue;
-        log("ACZ model descriptor: draw=%llu table=%zu slot=%u gpu=0x%llx size=%u stride=%u",
-          static_cast<unsigned long long>(drawId), table, slot,
-          static_cast<unsigned long long>(bufferLocation), bufferSize, structureStride);
-      }
+  // The record is found by its own shape instead of by an address, because the
+  // buffer view that names it cannot be resolved and the addresses read out of
+  // the descriptor table belong to a texture. Two of its rows do not occur by
+  // accident: the rotation basis ends in a zero translation, and the projection
+  // constants are the half viewport of the rasterised target.
+  constexpr size_t kRecordShapeSize = 0x1A0;
+
+  // The viewport remap row is a constant of the render target, so testing it first
+  // rejects almost every offset a full-buffer scan visits for the price of four
+  // comparisons. Every test is written so that a NaN fails it: a tolerance
+  // comparison against NaN is false, which would otherwise let a half-written
+  // record through, and an explicit finiteness pass over all 104 floats costs far
+  // too much to run at every offset the scan visits.
+  bool recordShapeMatches(const float* f) {
+    if (!(std::abs(f[0x190 / 4] - 512.0f) <= 0.01f))
+      return false;
+    if (!(std::abs(f[0x194 / 4] + 448.0f) <= 0.01f))
+      return false;
+    if (!(std::abs(f[0x198 / 4] - 2048.0f) <= 0.01f))
+      return false;
+    if (!(std::abs(f[0x19C / 4] - 2048.0f) <= 0.01f))
+      return false;
+    // The fourth row of the same matrix is the sub-mesh's offset inside the model, so
+    // it is zero only for the parts that sit on the model origin. It is bounded rather
+    // than required to be zero, which keeps the zero-filled and projection-like blocks
+    // out while letting every other part of the model through: a capture of the takeoff
+    // frame shows offsets of 11.96, 16.55 and 20.29 against a model roughly 20 units
+    // long, and a NaN fails the comparison and is rejected with the rest.
+    if (!(std::abs(f[0x13C / 4] - 1.0f) <= 1.0e-4f))
+      return false;
+    {
+      const float offsetX = f[0x130 / 4];
+      const float offsetY = f[0x134 / 4];
+      const float offsetZ = f[0x138 / 4];
+      const float offsetLength = std::sqrt(offsetX * offsetX + offsetY * offsetY
+        + offsetZ * offsetZ);
+      if (!(offsetLength <= 256.0f))
+        return false;
     }
+    // The basis above the translation must be orthonormal, which rejects the many
+    // zero-filled and projection-like blocks that also end in (0,0,0,1).
+    for (uint32_t row = 0; row < 3; ++row) {
+      const float* r = f + (0x100 / 4) + row * 4;
+      const float length = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+      if (!(std::abs(length - 1.0f) <= 2.0e-3f) || !(std::abs(r[3]) <= 1.0e-4f))
+        return false;
+    }
+    // The player aircraft is drawn centred, so the origin's clip x is exactly half
+    // the viewport times the view depth. Other aircraft are off centre and miss
+    // this, which is what makes the relation a reliable discriminator.
+    const float depth = f[0x03C / 4];
+    const float clipX = f[0x030 / 4];
+    if (!(std::abs(depth) > 1.0f) || !(std::abs(depth) <= 1.0e5f))
+      return false;
+    if (!(std::abs(clipX - 2048.0f * depth) <= 0.02f * std::abs(clipX)))
+      return false;
+    return true;
   }
 
-  bool findModelRecordDescriptor(
-      const D3D12_GPU_DESCRIPTOR_HANDLE* tables,
-      D3D12_GPU_VIRTUAL_ADDRESS& address,
-      uint32_t& tableSlot) {
-    constexpr uint32_t kRecordBytes = 416;
-    constexpr uint32_t kSlotLimit = 32;
+  // The arena holding the records is a ring buffer that is written while the frame
+  // is recorded, so an address found in it once holds a later frame's contents
+  // afterwards. Scanning it for a record therefore cannot be trusted: the frame a
+  // candidate came from is unknown, and the camera it describes is that frame's.
+  // Records are now read only from the vertex buffer the draw itself names.
 
-    if (!tables)
+  // A RenderDoc capture of this shader shows the instance block and the draw's
+  // vertex stream adjacent in one buffer, with the block exactly 416 bytes before
+  // the stream. Only the draws where that holds are reported, which keeps the line
+  // to the aircraft itself instead of every object the shader covers.
+  std::unordered_set<uint64_t> g_vertexBufferRecordLogged;
+
+  void verifyRecordBeforeVertexBuffer(const D3D12_VERTEX_BUFFER_VIEW& vertexBuffer) {
+    if (!vertexBuffer.BufferLocation || vertexBuffer.BufferLocation < kRecordShapeSize)
+      return;
+    const D3D12_GPU_VIRTUAL_ADDRESS address =
+      vertexBuffer.BufferLocation - kRecordShapeSize;
+    if (!g_vertexBufferRecordLogged.emplace(address).second)
+      return;
+    std::vector<uint8_t> bytes;
+    if (!readGpuBuffer(address, kRecordShapeSize, bytes) || bytes.size() < kRecordShapeSize)
+      return;
+    const float* record = reinterpret_cast<const float*>(bytes.data());
+    if (!recordShapeMatches(record))
+      return;
+    log("ACZ vb record: va=0x%llx placementT=(%.3f,%.3f,%.3f) w=%.4f depth=%.3f",
+      static_cast<unsigned long long>(address),
+      static_cast<double>(record[0x130 / 4]), static_cast<double>(record[0x134 / 4]),
+      static_cast<double>(record[0x138 / 4]), static_cast<double>(record[0x13C / 4]),
+      static_cast<double>(record[0x03C / 4]));
+  }
+
+  // Vertex buffer of the draw being recorded, which names its instance block.
+  D3D12_GPU_VIRTUAL_ADDRESS g_currentVertexBuffer = 0;
+  // Index count of the draw being placed, so the summary can tell two submissions of the
+  // same mesh apart from two different meshes without another round trip.
+  uint32_t g_currentIndexCount = 0;
+
+  // Turns a draw's record into the world position the draw puts its object at. The
+  // record's leading matrix maps the model origin to the clip position the game
+  // rasterises the aircraft at, so pushing that position back through the camera
+  // the game rendered with yields the world position.
+  //
+  // The record is read only from the vertex buffer the draw names, because a record
+  // found anywhere else belongs to a different frame or a different pass and the
+  // camera it describes is not the one this draw uses. A draw whose own record is
+  // unreadable keeps the position of the last record that was readable rather than
+  // taking one from elsewhere, which is what used to slide the model away from the
+  // camera as the arena ring advanced.
+  float g_resolvedAircraft[3] = { 0.0f, 0.0f, 0.0f };
+  bool g_resolvedAircraftValid = false;
+  bool g_resolvedAircraftReused = false;
+  float g_resolvedAircraftLogged[31] = {};
+  // The engine target seen on the previous draw. The recorded draw renders the position
+  // the engine reported one frame earlier, so this is what the aircraft is placed at.
+  float g_cachedTarget[3] = { 0.0f, 0.0f, 0.0f };
+  bool g_cachedTargetValid = false;
+  // The last target value read, kept apart from the cached one so a frame's first draw
+  // moves the cache and every later draw of that same frame keeps using it.
+  float g_targetSeen[3] = { 0.0f, 0.0f, 0.0f };
+  bool g_targetSeenValid = false;
+  float g_resolvedAircraftBasis[9] = {};
+  // The record's attitude is advanced one frame ahead of the camera the frame is submitted
+  // with, the same way its position is ahead of the engine target, so every sub-mesh is
+  // held back by one frame. Each part keeps its own basis because the record's matrix also
+  // carries that part's local rotation.
+  // The record carries no stable per part identity: its offset rotates with the aircraft,
+  // its vertex buffer address is recycled, and neither the index count nor the offset
+  // length separates the parts that share a model origin. What is stable is the order the
+  // sub-meshes are drawn in, so the attitude cache is keyed by that order instead.
+  constexpr uint32_t kAczPartSlots = 256;
+  struct AczPartSlot {
+    float basis[9] = {};
+    float prev[9] = {};
+    float offset[3] = {};
+    float prevOffset[3] = {};
+    bool prevValid = false;
+    bool basisValid = false;
+  };
+  AczPartSlot g_partSlots[kAczPartSlots] {};
+  uint32_t g_partSlotIndex = 0;
+  float g_frameMarker[9] = {};
+  bool g_frameMarkerValid = false;
+  // The offset the resolved record gave its sub-mesh, kept beside the basis so a draw
+  // that has to reuse the last record reuses the matching offset as well.
+  float g_resolvedAircraftOffset[3] = { 0.0f, 0.0f, 0.0f };
+  // Meshes already placed in this frame. ACZ draws every part of the aircraft twice: the
+  // base pass first, then an additive highlight pass that reads the same record and the
+  // same vertices. The second submission is the same geometry with the same transform, so
+  // it is dropped instead of putting two coincident copies of every part in the scene.
+  std::vector<std::pair<D3D12_GPU_VIRTUAL_ADDRESS, uint32_t>> g_placedMeshes;
+
+  bool placedMeshSubmitted(D3D12_GPU_VIRTUAL_ADDRESS vertexBuffer, uint32_t indexCount) {
+    for (const auto& entry : g_placedMeshes) {
+      if (entry.first == vertexBuffer && entry.second == indexCount)
+        return true;
+    }
+    return false;
+  }
+
+  // Copies from the game image or from an object the game published, but only after
+  // every page the range touches is proved committed and readable. The engine writes
+  // these pointers during scene setup, so a render-thread read can otherwise land on
+  // a page that is still reserved or guarded and fault the whole frame.
+  bool copyReadableMemory(uintptr_t address, void* destination, size_t size) {
+    if (address == 0 || destination == nullptr || size == 0)
+      return false;
+    uintptr_t cursor = address;
+    const uintptr_t end = address + size;
+    while (cursor < end) {
+      MEMORY_BASIC_INFORMATION info {};
+      if (VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &info, sizeof(info)) == 0)
+        return false;
+      if (info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0)
+        return false;
+      const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+      if (regionEnd <= cursor)
+        return false;
+      cursor = regionEnd;
+    }
+    std::memcpy(destination, reinterpret_cast<const void*>(address), size);
+    return true;
+  }
+
+  // The engine keeps one view per player and that view names the object its camera is
+  // framed around, whose position is a world position the chase camera is rebuilt from
+  // every frame. Reading it therefore returns where the game itself believes the
+  // aircraft is, with no reconstruction and no fit to a captured framing.
+  //
+  // The chain comes from the game's own code: the engine stores its own address in a
+  // global while the scene is built, the per-player view array hangs off the engine at
+  // +0x697B8, the view names its target at +0x110 and the target's world position is the
+  // float4 at +0x258.
+  constexpr uintptr_t kEngineGlobalOffset = 0x3409F8;
+  constexpr uintptr_t kViewIndexOffset = 0x3409F2;
+  constexpr uintptr_t kViewArrayOffset = 0x697B8;
+  constexpr uintptr_t kViewTargetOffset = 0x110;
+  constexpr uintptr_t kTargetWorldOffset = 0x258;
+
+  bool readPlayerTargetWorld(float out[3]) {
+    const HMODULE image = GetModuleHandleW(nullptr);
+    if (!image)
+      return false;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(image);
+    uintptr_t engine = 0;
+    if (!copyReadableMemory(base + kEngineGlobalOffset, &engine, sizeof(engine)) || !engine)
+      return false;
+    uintptr_t views = 0;
+    if (!copyReadableMemory(engine + kViewArrayOffset, &views, sizeof(views)) || !views)
+      return false;
+    uint8_t viewIndex = 0;
+    if (!copyReadableMemory(base + kViewIndexOffset, &viewIndex, sizeof(viewIndex)))
+      return false;
+    uintptr_t view = 0;
+    if (!copyReadableMemory(views + static_cast<uintptr_t>(viewIndex) * sizeof(uintptr_t),
+          &view, sizeof(view)) || !view)
+      return false;
+    uintptr_t target = 0;
+    if (!copyReadableMemory(view + kViewTargetOffset, &target, sizeof(target)) || !target)
+      return false;
+    float position[4] = {};
+    if (!copyReadableMemory(target + kTargetWorldOffset, position, sizeof(position)))
+      return false;
+    if (!std::isfinite(position[0]) || !std::isfinite(position[1]) || !std::isfinite(position[2]))
+      return false;
+    if (position[0] == 0.0f && position[1] == 0.0f && position[2] == 0.0f)
+      return false;
+    for (uint32_t index = 0; index < 3; ++index)
+      out[index] = position[index];
+    return true;
+  }
+
+  bool resolveRecordWorld(
+      const AczCameraMatrices& camera,
+      float out[3],
+      float outBasis[9],
+      float outOffset[3]) {
+    std::vector<uint8_t> bytes;
+    // The instance block sits exactly 416 bytes before the draw's vertex stream in
+    // the same buffer, so the vertex buffer address names the record directly.
+    const bool readable = g_currentVertexBuffer >= kRecordShapeSize
+      && readGpuBuffer(g_currentVertexBuffer - kRecordShapeSize, kRecordShapeSize, bytes)
+      && bytes.size() >= kRecordShapeSize;
+    const bool direct = readable
+      && recordShapeMatches(reinterpret_cast<const float*>(bytes.data()));
+    if (!direct) {
+      // A record that is there and does not describe the player aircraft belongs to
+      // another object this shader also draws, so that draw keeps its own matrix. Only a
+      // record that could not be read at all continues the last placement.
+      if (readable)
+        return false;
+      if (!g_resolvedAircraftValid)
+        return false;
+      if (!g_resolvedAircraftReused) {
+        g_resolvedAircraftReused = true;
+        log("ACZ aircraft carry: draw has no record of its own, keeping (%.2f,%.2f,%.2f)",
+          static_cast<double>(g_resolvedAircraft[0]),
+          static_cast<double>(g_resolvedAircraft[1]),
+          static_cast<double>(g_resolvedAircraft[2]));
+      }
+      out[0] = g_resolvedAircraft[0];
+      out[1] = g_resolvedAircraft[1];
+      out[2] = g_resolvedAircraft[2];
+      for (uint32_t index = 0; index < 9; ++index)
+        outBasis[index] = g_resolvedAircraftBasis[index];
+      for (uint32_t index = 0; index < 3; ++index)
+        outOffset[index] = g_resolvedAircraftOffset[index];
+      return true;
+    }
+
+    const float* record = reinterpret_cast<const float*>(bytes.data());
+
+    // The record states the aircraft's placement relative to the camera, so the record's own
+    // reading is anchored on the camera block's eye. That reading is kept only as the
+    // comparison and as the fallback before the engine has published a position.
+    float anchor[4] = { camera.eye[0], camera.eye[1], camera.eye[2], 1.0f };
+
+    // The draw's own object matrix is exactly the rotation the shader applies to the
+    // model before the record's projection, so copying it is not a reconstruction:
+    // it is the value the game rasterises with. Everything after this point only
+    // decides where its origin sits in the world.
+    const float* objectBasis = record + (0x100 / 4);
+    for (uint32_t row = 0; row < 3; ++row) {
+      for (uint32_t column = 0; column < 3; ++column)
+        outBasis[row * 3 + column] = objectBasis[row * 4 + column];
+    }
+    // The fourth row of that matrix is where the sub-mesh sits inside the model, in the
+    // same frame the placement translation below is expressed in, so the two add. It is
+    // zero for the part the model is built around, which is why placing the record alone
+    // put the whole aircraft on one point and only the largest part stayed visible.
+    for (uint32_t index = 0; index < 3; ++index)
+      outOffset[index] = objectBasis[12 + index];
+
+    // The record's projection rows map the draw's frame into clip space, with half
+    // the viewport folded in. Removing that offset leaves the view axis as the
+    // fourth column and the two screen axes as the first two columns, so the point
+    // whose clip position collapses to zero can be solved for directly: it is the
+    // camera's position inside the frame. A draw whose placement translation is
+    // zero puts its object on the frame origin, so the object's world position is
+    // the absolute eye minus that camera position.
+    //
+    // Those columns are stored pre-rotated by the object's own basis, and the
+    // shader cancels that rotation again inside the product it forms, so the matrix
+    // the draw really uses is placement * record. The recovered directions have to
+    // be taken through the placement as well, otherwise the offset is measured in
+    // the object's frame and swings with the object's heading instead of staying
+    // fixed to the camera.
+    constexpr float kHalfViewport = 2048.0f;
+    const float axisLocal[3] = { record[3], record[7], record[11] };
+    const float screenXLocal[3] = {
+      record[0] - kHalfViewport * axisLocal[0],
+      record[4] - kHalfViewport * axisLocal[1],
+      record[8] - kHalfViewport * axisLocal[2],
+    };
+    const float screenYLocal[3] = {
+      record[1] - kHalfViewport * axisLocal[0],
+      record[5] - kHalfViewport * axisLocal[1],
+      record[9] - kHalfViewport * axisLocal[2],
+    };
+    // The record states the object's offsets in the draw's camera space: how far
+    // along the view axis it sits and how far off centre on each screen axis. Those
+    // three numbers are the part only the record knows. Their directions come from
+    // the camera the scene is rasterised with instead, because the record's own
+    // columns describe the camera of its own pass and drift a few degrees away from
+    // the one used here as soon as the object turns.
+    const float lengthX = std::sqrt(screenXLocal[0] * screenXLocal[0]
+      + screenXLocal[1] * screenXLocal[1] + screenXLocal[2] * screenXLocal[2]);
+    const float lengthY = std::sqrt(screenYLocal[0] * screenYLocal[0]
+      + screenYLocal[1] * screenYLocal[1] + screenYLocal[2] * screenYLocal[2]);
+    // These are the projection's half extents, a few hundred either way.
+    if (!(lengthX > 1.0f) || !(lengthY > 1.0f))
+      return false;
+    // The block's view rows are the camera basis in world space: row 2 is the
+    // negated view direction, row 1 the up axis and row 0 the right axis.
+    const float* basis = camera.view.data();
+    float axis[3] = { -basis[8], -basis[9], -basis[10] };
+    float screenX[3] = { basis[0], basis[1], basis[2] };
+    float screenY[3] = { -basis[4], -basis[5], -basis[6] };
+    const float axisLength = std::sqrt(axis[0] * axis[0] + axis[1] * axis[1]
+      + axis[2] * axis[2]);
+    const float rowXLength = std::sqrt(screenX[0] * screenX[0]
+      + screenX[1] * screenX[1] + screenX[2] * screenX[2]);
+    const float rowYLength = std::sqrt(screenY[0] * screenY[0]
+      + screenY[1] * screenY[1] + screenY[2] * screenY[2]);
+    if (!(axisLength > 0.5f) || !(rowXLength > 0.5f) || !(rowYLength > 0.5f))
+      return false;
+    for (uint32_t index = 0; index < 3; ++index) {
+      axis[index] /= axisLength;
+      screenX[index] /= rowXLength;
+      screenY[index] /= rowYLength;
+    }
+    const float deltaX = record[12] - kHalfViewport * record[15];
+    const float deltaY = record[13] - kHalfViewport * record[15];
+    for (uint32_t index = 0; index < 3; ++index) {
+      const float cameraInFrame = -record[15] * axis[index]
+                                - (deltaX / lengthX) * screenX[index]
+                                - (deltaY / lengthY) * screenY[index];
+      out[index] = anchor[index] - cameraInFrame;
+    }
+    if (!std::isfinite(out[0]) || !std::isfinite(out[1]) || !std::isfinite(out[2]))
       return false;
 
-    std::lock_guard lock(g_frameMutex);
-    for (size_t table = 0; table < 8; ++table) {
-      const uint64_t tableGpu = tables[table].ptr;
-      if (!tableGpu)
-        continue;
+    // Kept beside the record's own reading: the two disagree only while the aircraft is
+    // rotating or the camera is pitching, which is exactly what the summary line reports.
+    const float outCamera[3] = { out[0], out[1], out[2] };
 
-      const DescriptorHeapMetadata* heap = nullptr;
-      for (const auto& entry : g_descriptorHeaps) {
-        const auto& metadata = entry.second;
-        if (!metadata.gpuStart.ptr || !metadata.increment || tableGpu < metadata.gpuStart.ptr)
+    // The record also carries the camera directions, written in the object's own frame
+    // as the fourth column of its leading matrix and as the two screen columns offset by
+    // the half viewport. Taking those through the object basis at +0x100 gives the same
+    // directions in world space without borrowing them from the render camera, so the
+    // two readings differ only in where the directions came from. Only one of them can
+    // reproduce the position the game publishes for an aircraft standing still, which is
+    // the point this reports beside it.
+    {
+      const float* rotation = outBasis;
+      float local[3][3] = {
+        { axisLocal[0], axisLocal[1], axisLocal[2] },
+        { screenXLocal[0], screenXLocal[1], screenXLocal[2] },
+        { screenYLocal[0], screenYLocal[1], screenYLocal[2] },
+      };
+      float own[3][3] = {};
+      for (uint32_t vector = 0; vector < 3; ++vector) {
+        for (uint32_t column = 0; column < 3; ++column) {
+          own[vector][column] = local[vector][0] * rotation[0 * 3 + column]
+                              + local[vector][1] * rotation[1 * 3 + column]
+                              + local[vector][2] * rotation[2 * 3 + column];
+        }
+        const float length = std::sqrt(own[vector][0] * own[vector][0]
+          + own[vector][1] * own[vector][1] + own[vector][2] * own[vector][2]);
+        if (!(length > 0.0f))
           continue;
-        const uint64_t delta = tableGpu - metadata.gpuStart.ptr;
-        if (delta % metadata.increment || delta / metadata.increment >= metadata.count)
-          continue;
-        heap = &metadata;
-        break;
+        for (uint32_t column = 0; column < 3; ++column)
+          own[vector][column] /= length;
       }
-      if (!heap)
-        continue;
+      // The render-camera directions are the reference orientation, so each recovered
+      // direction is flipped onto the side it agrees with. That leaves the angle between
+      // them as the only difference, which is what the two readings are being compared on.
+      const float* reference[3] = { axis, screenX, screenY };
+      bool usable = true;
+      for (uint32_t vector = 0; vector < 3; ++vector) {
+        const float dotProduct = own[vector][0] * reference[vector][0]
+                               + own[vector][1] * reference[vector][1]
+                               + own[vector][2] * reference[vector][2];
+        if (std::abs(dotProduct) < 0.5f)
+          usable = false;
+        else if (dotProduct < 0.0f) {
+          for (uint32_t column = 0; column < 3; ++column)
+            own[vector][column] = -own[vector][column];
+        }
+      }
+      if (usable) {
+        float ownWorld[3] = {};
+        for (uint32_t index = 0; index < 3; ++index) {
+          ownWorld[index] = anchor[index] + record[15] * own[0][index]
+                          + (deltaX / lengthX) * own[1][index]
+                          + (deltaY / lengthY) * own[2][index];
+        }
+        // The record's own directions are the ones that belong to this draw, so they
+        // define the world position. The render camera's directions stay in the log as
+        // the comparison and remain the fallback when the record's cannot be used.
+        for (uint32_t index = 0; index < 3; ++index)
+          out[index] = ownWorld[index];
+      }
+    }
 
-      const uint64_t baseIndex = (tableGpu - heap->gpuStart.ptr) / heap->increment;
-      for (uint32_t slot = 0; slot < kSlotLimit; ++slot) {
-        const uint64_t index = baseIndex + slot;
-        if (index >= heap->count)
-          break;
-        const uint64_t cpu = heap->cpuStart.ptr + index * heap->increment;
+    // The engine publishes the position it simulates, one frame ahead of what the
+    // recorded draw renders. Read every frame so the summary can show it.
+    float targetWorld[3] = {};
+    const bool haveTarget = readPlayerTargetWorld(targetWorld);
 
-        uint64_t bufferLocation = 0;
-        uint32_t bufferSize = 0;
-        uint32_t structureStride = 0;
-        std::memcpy(&bufferLocation, reinterpret_cast<const void*>(cpu), sizeof(bufferLocation));
-        std::memcpy(&bufferSize, reinterpret_cast<const void*>(cpu + 8), sizeof(bufferSize));
-        std::memcpy(&structureStride, reinterpret_cast<const void*>(cpu + 12),
-          sizeof(structureStride));
-        if (structureStride || bufferSize != kRecordBytes)
-          continue;
-        if (bufferLocation < 0x100000000ull || bufferLocation > 0x7fffffffffffull)
-          continue;
-        if ((bufferLocation & 0xf) != 0)
-          continue;
+    // The renderer's position is the engine target read during the previous frame, and the
+    // value is advanced once per frame at present time: the aircraft is submitted several
+    // times per frame, so advancing it here would put the later submissions a whole frame
+    // ahead of the first one, which is what showed up as a second aircraft.
+    const float recordWorld[3] = { out[0], out[1], out[2] };
+    bool usedCached = false;
+    if (haveTarget) {
+      for (uint32_t index = 0; index < 3; ++index)
+        g_targetSeen[index] = targetWorld[index];
+      g_targetSeenValid = true;
+      if (g_cachedTargetValid) {
+        for (uint32_t index = 0; index < 3; ++index)
+          out[index] = g_cachedTarget[index];
+        usedCached = true;
+      }
+    }
 
-        address = bufferLocation;
-        tableSlot = slot;
+    // Self check on the basis: the directions come from the same view rows the
+    // scene is drawn with, so these read minus one on the view axis, plus one on
+    // the right axis and minus one on the up axis. Anything else means the camera
+    // the block was read from is not the camera this draw used.
+    const float* view = camera.view.data();
+    const float alignAxis = axis[0] * view[8] + axis[1] * view[9] + axis[2] * view[10];
+    const float alignX = screenX[0] * view[0] + screenX[1] * view[1] + screenX[2] * view[2];
+    const float alignY = screenY[0] * view[4] + screenY[1] * view[5] + screenY[2] * view[6];
+
+    // Second, independent reading of the same record: its fourth row is the clip
+    // position of the frame origin, so pushing that through the inverse of the
+    // matrix the scene is rasterised with gives the world point without assuming
+    // anything about how the record is laid out. Reported next to the first so a
+    // disagreement between the two is visible instead of silently averaged.
+    float alternate[3] = {};
+    if (camera.hasDisplayProjection) {
+      std::array<float, 16> viewProjection {};
+      std::array<float, 16> inverseViewProjection {};
+      multiplyRowVectorMatrices(camera.view.data(), camera.displayProjection.data(),
+        viewProjection.data());
+      if (invertMatrix4(viewProjection.data(), inverseViewProjection.data())) {
+        float world[4] = {};
+        for (uint32_t column = 0; column < 4; ++column) {
+          world[column] = record[12] * inverseViewProjection[0 + column]
+                        + record[13] * inverseViewProjection[4 + column]
+                        + record[14] * inverseViewProjection[8 + column]
+                        + record[15] * inverseViewProjection[12 + column];
+        }
+        if (std::abs(world[3]) > 1.0e-6f) {
+          for (uint32_t component = 0; component < 3; ++component)
+            alternate[component] = world[component] / world[3];
+        }
+      }
+    }
+
+    // One line per distinct state: the camera eye, the position actually used, the
+    // record-derived position and the engine target, so the disagreement between them
+    // stays visible while the placement is being settled. The record's rotation basis and
+    // the camera's own world axes are carried as well, because how far the aircraft has
+    // rolled on screen depends on both: it is the angle between them, and a mismatch
+    // between the two is what makes the roll look larger than the game renders it.
+    const float logged[31] = {
+      camera.eye[0], camera.eye[1], camera.eye[2],
+      out[0], out[1], out[2],
+      recordWorld[0], recordWorld[1], recordWorld[2],
+      targetWorld[0], targetWorld[1], targetWorld[2],
+      record[15], outOffset[0], outOffset[1], outOffset[2],
+      outBasis[0], outBasis[1], outBasis[2],
+      outBasis[3], outBasis[4], outBasis[5],
+      outBasis[6], outBasis[7], outBasis[8],
+      screenX[0], screenX[1], screenX[2],
+      screenY[0], screenY[1], screenY[2] };
+    bool changed = false;
+    for (uint32_t index = 0; index < 31; ++index)
+      changed = changed || logged[index] != g_resolvedAircraftLogged[index];
+    static D3D12_GPU_VIRTUAL_ADDRESS loggedVertexBuffer = 0;
+    static uint32_t loggedIndexCount = 0;
+    changed = changed || g_currentVertexBuffer != loggedVertexBuffer
+                      || g_currentIndexCount != loggedIndexCount;
+    if (changed) {
+      loggedVertexBuffer = g_currentVertexBuffer;
+      loggedIndexCount = g_currentIndexCount;
+      std::memcpy(g_resolvedAircraftLogged, logged, sizeof(logged));
+      log("ACZ aircraft: eye=(%.2f,%.2f,%.2f) pos=(%.2f,%.2f,%.2f) off=(%.2f,%.2f,%.2f) rec=(%.2f,%.2f,%.2f) target=(%.2f,%.2f,%.2f) depth=%.2f cached=%d tgt=%d vb=0x%llx idx=%u rot=(%.4f,%.4f,%.4f)(%.4f,%.4f,%.4f)(%.4f,%.4f,%.4f) cr=(%.4f,%.4f,%.4f) cu=(%.4f,%.4f,%.4f)",
+        static_cast<double>(camera.eye[0]), static_cast<double>(camera.eye[1]),
+        static_cast<double>(camera.eye[2]),
+        static_cast<double>(out[0]), static_cast<double>(out[1]),
+        static_cast<double>(out[2]),
+        static_cast<double>(outOffset[0]), static_cast<double>(outOffset[1]),
+        static_cast<double>(outOffset[2]),
+        static_cast<double>(recordWorld[0]), static_cast<double>(recordWorld[1]),
+        static_cast<double>(recordWorld[2]),
+        static_cast<double>(targetWorld[0]), static_cast<double>(targetWorld[1]),
+        static_cast<double>(targetWorld[2]),
+        static_cast<double>(record[15]), usedCached ? 1 : 0, haveTarget ? 1 : 0,
+        static_cast<unsigned long long>(g_currentVertexBuffer), g_currentIndexCount,
+        static_cast<double>(outBasis[0]), static_cast<double>(outBasis[1]),
+        static_cast<double>(outBasis[2]), static_cast<double>(outBasis[3]),
+        static_cast<double>(outBasis[4]), static_cast<double>(outBasis[5]),
+        static_cast<double>(outBasis[6]), static_cast<double>(outBasis[7]),
+        static_cast<double>(outBasis[8]),
+        static_cast<double>(screenX[0]), static_cast<double>(screenX[1]),
+        static_cast<double>(screenX[2]),
+        static_cast<double>(screenY[0]), static_cast<double>(screenY[1]),
+        static_cast<double>(screenY[2]));
+    }
+
+    g_resolvedAircraft[0] = out[0];
+    g_resolvedAircraft[1] = out[1];
+    g_resolvedAircraft[2] = out[2];
+    for (uint32_t index = 0; index < 9; ++index)
+      g_resolvedAircraftBasis[index] = outBasis[index];
+    for (uint32_t index = 0; index < 3; ++index)
+      g_resolvedAircraftOffset[index] = outOffset[index];
+    g_resolvedAircraftValid = true;
+    g_resolvedAircraftReused = false;
+    return true;
+  }
+
+  // ACZ draws the player aircraft with a zero translation, so the transform that resolves
+  // from the bindings this layer can read carries rotation only. Its position comes from
+  // the engine, passed through the cache that runs one frame behind the simulation.
+  // Reports whether the draw's own record described the player aircraft, which is what
+  // decides that this draw is one of its sub-meshes.
+  bool placeAircraftInCameraFrame(
+      const AczCameraMatrices& camera,
+      std::array<float, 16>& objectToWorld,
+      uint8_t& objectTransformSource) {
+    // The record wins over the rig reconstruction whenever it can be resolved.
+    {
+      float resolved[3] {};
+      float resolvedBasis[9] {};
+      float resolvedOffset[3] {};
+      if (resolveRecordWorld(camera, resolved, resolvedBasis, resolvedOffset)) {
+        // The vertex stream already carries the camera orientation: the object matrix
+        // in the record cancels against the record's projection, so the game folds the
+        // object's rotation into the vertices themselves. Submitting the mesh with an
+        // identity matrix therefore still makes it follow the camera, and tipping the
+        // view up tips the aircraft into the ground. The inverse of the camera rotation
+        // undoes it, which is the transpose of the view basis in row vector form.
+        // The vertex stream is model space: a captured draw's first vertex is
+        // (-14.754, -1.0937, 3.812), the same values the record's own shader reads,
+        // so the object's orientation cannot come from the vertices. It comes from
+        // the record's own object matrix at +0x100, which a capture taken with the
+        // camera turned 45 degrees shows as the identity while the record's view
+        // axis carries the 45 degrees: the matrix is the object's world rotation,
+        // not the camera's.
+        for (uint32_t row = 0; row < 3; ++row) {
+          for (uint32_t column = 0; column < 3; ++column)
+            objectToWorld[row * 4 + column] = resolvedBasis[row * 3 + column];
+          objectToWorld[row * 4 + 3] = 0.0f;
+        }
+        // The record's matrix is one frame ahead of the camera the frame is submitted
+        // with, the same way its position is ahead of the engine target, so each sub-mesh
+        // is held back by one frame. The cache is keyed by the order the sub-meshes are
+        // drawn in, which is the only identity that survives a frame: the record's offset
+        // rotates with the aircraft and the vertex buffer address is recycled.
+        //
+        // The body's rotation marks a drawn frame. When it changes, the slot cursor and
+        // every slot's prev advance, so all sub-meshes of one frame read the attitude of
+        // the previous frame whatever order they are drawn in.
+        {
+          bool newFrame = false;
+          if (g_currentIndexCount == 1695) {
+            for (uint32_t index = 0; index < 9; ++index) {
+              if (!g_frameMarkerValid || resolvedBasis[index] != g_frameMarker[index]) {
+                newFrame = true;
+                break;
+              }
+            }
+            if (newFrame) {
+              for (uint32_t slot = 0; slot < kAczPartSlots; ++slot) {
+                if (!g_partSlots[slot].basisValid)
+                  continue;
+                for (uint32_t element = 0; element < 9; ++element)
+                  g_partSlots[slot].prev[element] = g_partSlots[slot].basis[element];
+                for (uint32_t element = 0; element < 3; ++element)
+                  g_partSlots[slot].prevOffset[element] = g_partSlots[slot].offset[element];
+                g_partSlots[slot].prevValid = true;
+              }
+              for (uint32_t index = 0; index < 9; ++index)
+                g_frameMarker[index] = resolvedBasis[index];
+              g_frameMarkerValid = true;
+              g_partSlotIndex = 0;
+              static bool loggedLag = false;
+              if (!loggedLag) {
+                loggedLag = true;
+                log("ACZ aircraft lag: sub-mesh attitude and offset held back one frame");
+              }
+            }
+          }
+          const uint32_t slotIndex = g_partSlotIndex % kAczPartSlots;
+          ++g_partSlotIndex;
+          AczPartSlot& slot = g_partSlots[slotIndex];
+          float chosen[9] {};
+          if (slot.prevValid) {
+            for (uint32_t index = 0; index < 9; ++index)
+              chosen[index] = slot.prev[index];
+          } else {
+            for (uint32_t index = 0; index < 9; ++index)
+              chosen[index] = resolvedBasis[index];
+          }
+          for (uint32_t index = 0; index < 9; ++index)
+            slot.basis[index] = resolvedBasis[index];
+          for (uint32_t index = 0; index < 3; ++index)
+            slot.offset[index] = resolvedOffset[index];
+          slot.basisValid = true;
+          // The offset rotates with the aircraft, so it has to come from the same frame as
+          // the attitude. Pairing a current offset with a lagged attitude makes every part
+          // off the model origin swing one frame further than the fuselage.
+          if (slot.prevValid) {
+            for (uint32_t index = 0; index < 3; ++index)
+              resolvedOffset[index] = slot.prevOffset[index];
+          }
+          for (uint32_t row = 0; row < 3; ++row) {
+            for (uint32_t column = 0; column < 3; ++column)
+              objectToWorld[row * 4 + column] = chosen[row * 3 + column];
+          }
+        }
+        // The record places the model the part belongs to, and the part's own offset is
+        // part of the same matrix, so the two add to give where this sub-mesh sits.
+        objectToWorld[12] = resolved[0] + resolvedOffset[0];
+        objectToWorld[13] = resolved[1] + resolvedOffset[1];
+        objectToWorld[14] = resolved[2] + resolvedOffset[2];
+        objectToWorld[15] = 1.0f;
+        // Marks this draw as deliberately placed. The backend drops draws whose
+        // matrix is the identity because the game uses that to mean "the placement
+        // lives in the fused matrix", which does not apply here: the translation
+        // above is a real world position, and the rotation can legitimately be the
+        // identity while the camera looks down a world axis.
+        objectTransformSource = 8;
+        // The record only says where the model sits; the rotation and any scale on
+        // the mesh are whatever the draw already carried. Reported on change, since
+        // a mesh that is tilted or scaled wrongly is the one remaining way the
+        // aircraft can end up under the ground while its origin is correct.
+        static float lastMatrix[16] = {};
+        bool changed = false;
+        for (uint32_t index = 0; index < 16; ++index)
+          changed = changed || objectToWorld[index] != lastMatrix[index];
+        if (changed) {
+          std::memcpy(lastMatrix, objectToWorld.data(), sizeof(lastMatrix));
+          log("ACZ aircraft matrix: (%.4f,%.4f,%.4f,%.4f)(%.4f,%.4f,%.4f,%.4f)(%.4f,%.4f,%.4f,%.4f)(%.4f,%.4f,%.4f,%.4f)",
+            static_cast<double>(objectToWorld[0]), static_cast<double>(objectToWorld[1]),
+            static_cast<double>(objectToWorld[2]), static_cast<double>(objectToWorld[3]),
+            static_cast<double>(objectToWorld[4]), static_cast<double>(objectToWorld[5]),
+            static_cast<double>(objectToWorld[6]), static_cast<double>(objectToWorld[7]),
+            static_cast<double>(objectToWorld[8]), static_cast<double>(objectToWorld[9]),
+            static_cast<double>(objectToWorld[10]), static_cast<double>(objectToWorld[11]),
+            static_cast<double>(objectToWorld[12]), static_cast<double>(objectToWorld[13]),
+            static_cast<double>(objectToWorld[14]), static_cast<double>(objectToWorld[15]));
+        }
         return true;
       }
     }
     return false;
   }
+  // DrawACM_v reads its record through t10 as a structured buffer whose element is
+  // 416 bytes, and the descriptor naming it is the tenth slot of the SRV table. The
+  // view base is the record address, so the record is read straight from it and the
+  // object matrix is reported from its first 64 bytes.
+  // SrtData is 416 bytes: five 4x4 matrices followed by six float4 terms.
+  constexpr size_t kRecordBytes = 416;
 
-  // Dumps the record once its descriptor is known, so the matrix order is read
-  // off the values instead of being inferred from a placement result.
-  void logAczModelRecord(uint64_t drawId, D3D12_GPU_VIRTUAL_ADDRESS address, uint32_t tableSlot) {
-    static std::atomic<uint32_t> dumps { 0 };
-    const uint32_t dumpIndex = dumps.fetch_add(1, std::memory_order_relaxed);
-    if (dumpIndex >= 4)
-      return;
-
-    std::vector<uint8_t> bytes;
-    if (!readGpuBuffer(address, 416, bytes) || bytes.size() < 416) {
-      log("ACZ model record: draw=%llu address=0x%llx slot=%u unreadable",
-        static_cast<unsigned long long>(drawId),
-        static_cast<unsigned long long>(address), tableSlot);
+  // Reports what the descriptor points at. The buffers holding the records are
+  // created through device interfaces this layer does not register, so the view
+  // registry is the only record of their resource; this inspects that record
+  // without touching the resource itself, because the view registry keeps a raw
+  // pointer that may already have been released.
+  void reportRecordDescriptor(
+      D3D12_CPU_DESCRIPTOR_HANDLE descriptor,
+      D3D12_GPU_VIRTUAL_ADDRESS recordAddress) {
+    std::lock_guard lock(g_frameMutex);
+    const auto it = g_descriptors.find(descriptor.ptr);
+    if (it == g_descriptors.end()) {
+      log("ACZ t10 view: found=0");
       return;
     }
+    const DescriptorMetadata& metadata = it->second;
+    const UINT64 offset = recordAddress >= metadata.resourceGpuAddress
+      ? recordAddress - metadata.resourceGpuAddress
+      : 0;
+    const bool covered = metadata.resourceDescription.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+      && metadata.resourceGpuAddress
+      && recordAddress >= metadata.resourceGpuAddress
+      && offset + kRecordBytes <= metadata.resourceDescription.Width;
+    log("ACZ t10 view: found=1 dimension=%u width=%llu gpu=0x%llx off=%llu covered=%d",
+      static_cast<unsigned>(metadata.resourceDescription.Dimension),
+      static_cast<unsigned long long>(metadata.resourceDescription.Width),
+      static_cast<unsigned long long>(metadata.resourceGpuAddress),
+      static_cast<unsigned long long>(offset),
+      covered ? 1 : 0);
+  }
 
-    log("ACZ model record: draw=%llu address=0x%llx slot=%u",
-      static_cast<unsigned long long>(drawId),
-      static_cast<unsigned long long>(address), tableSlot);
-    const auto* values = reinterpret_cast<const float*>(bytes.data());
-    for (uint32_t row = 0; row < 26; ++row) {
-      log("ACZ model record +0x%03X: %12.5f %12.5f %12.5f %12.5f", row * 16,
-        static_cast<double>(values[row * 4 + 0]),
-        static_cast<double>(values[row * 4 + 1]),
-        static_cast<double>(values[row * 4 + 2]),
-        static_cast<double>(values[row * 4 + 3]));
+  // Lists the buffer resources the descriptor registry knows about. The record is
+  // a StructuredBuffer<SrtData> read through a buffer view, so a buffer resource of
+  // the right width identifies it. The view description is optional in D3D12 and
+  // the game leaves it null, so the resource description is what has to be used.
+  // Reported once per run.
+  void reportStructuredBufferViews() {
+    static std::atomic<bool> reportedOnce { false };
+    if (reportedOnce.exchange(true))
+      return;
+    std::lock_guard lock(g_frameMutex);
+    uint32_t reported = 0;
+    for (const auto& entry : g_descriptors) {
+      const DescriptorMetadata& view = entry.second;
+      if (view.resourceDescription.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+        continue;
+      const bool hasView = view.viewDescriptionSize
+        >= sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC);
+      const auto* srv = hasView
+        ? reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(
+            view.viewDescription.data())
+        : nullptr;
+      if (reported >= 96)
+        break;
+      ++reported;
+      log("ACZ t10 struct: cpu=0x%llx hasView=%d stride=%u elements=%u first=%llu width=%llu gpu=0x%llx format=%u",
+        static_cast<unsigned long long>(entry.first),
+        hasView ? 1 : 0,
+        srv ? srv->Buffer.StructureByteStride : 0u,
+        srv ? srv->Buffer.NumElements : 0u,
+        srv ? static_cast<unsigned long long>(srv->Buffer.FirstElement) : 0ull,
+        static_cast<unsigned long long>(view.resourceDescription.Width),
+        static_cast<unsigned long long>(view.resourceGpuAddress),
+        static_cast<unsigned>(view.format));
+    }
+    log("ACZ t10 struct: total=%u", reported);
+  }
+
+  void reportSrtDescriptor(const D3D12_GPU_DESCRIPTOR_HANDLE* tables, uint32_t tableCount) {
+    if (!tables)
+      return;
+    for (uint32_t table = 0; table < tableCount; ++table) {
+      if (!tables[table].ptr)
+        continue;
+      for (const auto& entry : g_descriptorHeaps) {
+        const DescriptorHeapMetadata& meta = entry.second;
+        if (meta.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+          continue;
+        if (!meta.cpuStart.ptr || !meta.gpuStart.ptr || !meta.increment)
+          continue;
+        if (tables[table].ptr < meta.gpuStart.ptr)
+          continue;
+        const UINT64 span = static_cast<UINT64>(meta.increment) * meta.count;
+        if (tables[table].ptr >= meta.gpuStart.ptr + span)
+          continue;
+        const UINT64 delta = tables[table].ptr - meta.gpuStart.ptr;
+        if ((delta % meta.increment) != 0)
+          continue;
+        const uint32_t index = static_cast<uint32_t>(delta / meta.increment) + 10u;
+        if (index >= meta.count)
+          continue;
+        const UINT64 tableCpu = meta.cpuStart.ptr + delta;
+        const auto* words = reinterpret_cast<const uint32_t*>(
+          meta.cpuStart.ptr + static_cast<SIZE_T>(index) * meta.increment);
+        const D3D12_GPU_VIRTUAL_ADDRESS recordAddress =
+          static_cast<UINT64>(words[0]) | (static_cast<UINT64>(words[1]) << 32);
+        auto stateIt = g_recordStates.find(recordAddress);
+        if (stateIt == g_recordStates.end()) {
+          if (g_recordStates.size() >= kReportedRecordLimit)
+            return;
+          stateIt = g_recordStates.emplace(recordAddress, RecordState {}).first;
+        }
+        RecordState& state = stateIt->second;
+        const bool newAddress = !state.described;
+        if (newAddress) {
+          state.described = true;
+          log("ACZ t10: table=%u slot=%u va=0x%llx size=%u w3=0x%x cpu=0x%llx",
+            table, index, static_cast<unsigned long long>(recordAddress), words[2], words[3],
+            static_cast<unsigned long long>(static_cast<UINT64>(meta.cpuStart.ptr)
+              + static_cast<UINT64>(index) * meta.increment));
+          // The record lives in a default heap, so the host can only ever see it
+          // after a copy into that memory has been mirrored. Noting the address
+          // arms the mirror for the next copy that lands on it.
+          noteRecordAddress(recordAddress);
+        }
+
+        std::vector<uint8_t> record;
+        const bool haveRecord = recordAddress
+          && (readRecordShadow(recordAddress, 416, record)
+           || readGpuBuffer(recordAddress, 416, record))
+          && record.size() >= 416;
+        // The buffers holding the records are created through device interfaces
+        // that never reach the address registry, so the view registry is the only
+        // route to their resource.
+        // The shader's register index is not the slot index: a root descriptor
+        // The record is a StructuredBuffer<SrtData>, so its view carries a
+        // 416-byte structure stride. The register index is not the slot index, and
+        // the slot it points at holds a texture, so the table is scanned in raw
+        // memory for that stride instead of offsetting from the register number.
+        if (g_scannedTables.emplace(tableCpu).second) {
+          for (uint32_t candidate = 0; candidate < 256; ++candidate) {
+            const UINT64 offset = static_cast<UINT64>(candidate) * meta.increment;
+            if (offset + meta.increment > static_cast<UINT64>(meta.count) * meta.increment)
+              break;
+            const auto* w = reinterpret_cast<const uint32_t*>(tableCpu + offset);
+            if (w[3] != kRecordBytes)
+              continue;
+            const D3D12_GPU_VIRTUAL_ADDRESS va =
+              static_cast<UINT64>(w[0]) | (static_cast<UINT64>(w[1]) << 32);
+            log("ACZ t10 hit: slot=%u va=0x%llx size=%u stride=%u",
+              candidate, static_cast<unsigned long long>(va), w[2], w[3]);
+          }
+          log("ACZ t10 hit: scanned table=0x%llx", static_cast<unsigned long long>(tableCpu));
+        }
+        if (!haveRecord && recordAddress) {
+          const D3D12_CPU_DESCRIPTOR_HANDLE descriptor {
+            meta.cpuStart.ptr + static_cast<SIZE_T>(index) * meta.increment };
+          if (g_reportedDescriptors.emplace(descriptor.ptr).second)
+            reportRecordDescriptor(descriptor, recordAddress);
+        }
+        if (!haveRecord) {
+          if (newAddress) {
+            uint32_t heapType = 0;
+            UINT64 bufferSize = 0;
+            const int probe = probeGpuBuffer(recordAddress, 416, heapType, bufferSize);
+            const RegistryCoverage coverage = describeRegistry(recordAddress, 416);
+            log("ACZ t10: unreadable probe=%d heap=%u size=%llu total=%zu near=0x%llx+%llu off=%llu covered=%d",
+              probe, heapType, static_cast<unsigned long long>(bufferSize),
+              coverage.resourceCount,
+              static_cast<unsigned long long>(coverage.nearestBase),
+              static_cast<unsigned long long>(coverage.nearestSize),
+              static_cast<unsigned long long>(coverage.offset),
+              coverage.covered ? 1 : 0);
+          }
+          return;
+        }
+        if (state.readable)
+          return;
+        state.readable = true;
+        const auto* r = reinterpret_cast<const float*>(record.data());
+        log("ACZ t10 m0: t=(%.2f,%.2f,%.2f) r=(%.3f,%.3f,%.3f)(%.3f,%.3f,%.3f)(%.3f,%.3f,%.3f) w=%.3f",
+          static_cast<double>(r[12]), static_cast<double>(r[13]), static_cast<double>(r[14]),
+          static_cast<double>(r[0]), static_cast<double>(r[1]), static_cast<double>(r[2]),
+          static_cast<double>(r[4]), static_cast<double>(r[5]), static_cast<double>(r[6]),
+          static_cast<double>(r[8]), static_cast<double>(r[9]), static_cast<double>(r[10]),
+          static_cast<double>(r[15]));
+        log("ACZ t10 m4: (%.2f,%.2f,%.2f,%.2f)(%.2f,%.2f,%.2f,%.2f)(%.2f,%.2f,%.2f,%.2f)(%.2f,%.2f,%.2f,%.2f)",
+          static_cast<double>(r[64]), static_cast<double>(r[65]),
+          static_cast<double>(r[66]), static_cast<double>(r[67]),
+          static_cast<double>(r[68]), static_cast<double>(r[69]),
+          static_cast<double>(r[70]), static_cast<double>(r[71]),
+          static_cast<double>(r[72]), static_cast<double>(r[73]),
+          static_cast<double>(r[74]), static_cast<double>(r[75]),
+          static_cast<double>(r[76]), static_cast<double>(r[77]),
+          static_cast<double>(r[78]), static_cast<double>(r[79]));
+
+        // The record's leading matrix maps the model origin to the clip position
+        // the game rasterises the aircraft at, so pushing that clip position back
+        // through the camera the game rendered with yields its world position.
+        // Nothing here is fitted: both matrices come from the game.
+        {
+          AczCameraMatrices recordCamera {};
+          if (buildAczCamera(recordCamera) && recordCamera.hasDisplayProjection) {
+            std::array<float, 16> viewProjection {};
+            multiplyRowVectorMatrices(recordCamera.view.data(),
+              recordCamera.displayProjection.data(), viewProjection.data());
+            std::array<float, 16> inverseViewProjection {};
+            if (invertMatrix4(viewProjection.data(), inverseViewProjection.data())) {
+              float world[4] = {};
+              for (uint32_t column = 0; column < 4; ++column) {
+                world[column] = r[12] * inverseViewProjection[0 + column]
+                              + r[13] * inverseViewProjection[4 + column]
+                              + r[14] * inverseViewProjection[8 + column]
+                              + r[15] * inverseViewProjection[12 + column];
+              }
+              if (std::isfinite(world[3]) && std::abs(world[3]) > 1.0e-6f) {
+                float resolved[3] = {
+                  world[0] / world[3], world[1] / world[3], world[2] / world[3] };
+                const bool finite = std::isfinite(resolved[0])
+                  && std::isfinite(resolved[1]) && std::isfinite(resolved[2]);
+                if (finite) {
+                  g_recordWorld[0] = resolved[0];
+                  g_recordWorld[1] = resolved[1];
+                  g_recordWorld[2] = resolved[2];
+                  g_recordWorldValid.store(true, std::memory_order_relaxed);
+                  if (!g_recordWorldReported.exchange(true)) {
+                    const double dx = static_cast<double>(resolved[0]) - recordCamera.eye[0];
+                    const double dy = static_cast<double>(resolved[1]) - recordCamera.eye[1];
+                    const double dz = static_cast<double>(resolved[2]) - recordCamera.eye[2];
+                    log("ACZ record world: w=(%.2f,%.2f,%.2f) eye=(%.2f,%.2f,%.2f) eyeDist=%.2f depth=%.3f",
+                      static_cast<double>(resolved[0]), static_cast<double>(resolved[1]),
+                      static_cast<double>(resolved[2]),
+                      static_cast<double>(recordCamera.eye[0]),
+                      static_cast<double>(recordCamera.eye[1]),
+                      static_cast<double>(recordCamera.eye[2]),
+                      std::sqrt(dx * dx + dy * dy + dz * dz),
+                      static_cast<double>(r[15]));
+                  }
+                }
+              }
+            }
+          }
+        }
+        return;
+      }
     }
   }
 
@@ -2358,6 +3046,8 @@ namespace remix {
       UINT vertexCount,
       const D3D12_GPU_VIRTUAL_ADDRESS* graphicsRootSrvs) {
     initializeD3D12RuntimeAdapter();
+    g_currentVertexBuffer = vertexBuffer.BufferLocation;
+    g_currentIndexCount = indexCount;
     const uint64_t drawStartTicks = perfTicks();
     const uint64_t count = ++g_drawCount;
     uint64_t drawFrame = 0;
@@ -2537,18 +3227,27 @@ namespace remix {
       }
       nativePipelineInfoPtr = &nativePipelineInfo;
     }
-    if (graphicsRootSrvs) {
-      static std::atomic<uint32_t> rootSrvDiag { 0 };
-      if (rootSrvDiag.fetch_add(1, std::memory_order_relaxed) < 2) {
-        log("D3D12 root srv diag: (0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx)",
-          static_cast<unsigned long long>(graphicsRootSrvs[0]),
-          static_cast<unsigned long long>(graphicsRootSrvs[1]),
-          static_cast<unsigned long long>(graphicsRootSrvs[2]),
-          static_cast<unsigned long long>(graphicsRootSrvs[3]),
-          static_cast<unsigned long long>(graphicsRootSrvs[4]),
-          static_cast<unsigned long long>(graphicsRootSrvs[5]),
-          static_cast<unsigned long long>(graphicsRootSrvs[6]),
-          static_cast<unsigned long long>(graphicsRootSrvs[7]));
+    // DrawACM_v reads its record through t10 as a StructuredBuffer<SrtData> whose
+    // element is 416 bytes. A root SRV never appears in a descriptor table, so the
+    // root slots are the only place it can be bound, and the object CBV holds the
+    // eight-byte SrtInputData rather than a matrix.
+    if (nativePipelineInfo.vertexShaderHash == 0xb6a7d1d096ce8fe7ull) {
+      reportSrtDescriptor(graphicsDescriptorTables, 16u);
+      verifyRecordBeforeVertexBuffer(vertexBuffer);
+      // The record is bound to register t10, and a table that does not start at t0
+      // hides which slot that is. A root descriptor is not in any table, so the
+      // root SRV slots and the table pointers are reported once as well.
+      static std::atomic<bool> reportedAircraftRootSrvs { false };
+      if (!reportedAircraftRootSrvs.exchange(true)) {
+        for (uint32_t slot = 0; slot < 16; ++slot) {
+          const D3D12_GPU_VIRTUAL_ADDRESS address =
+            graphicsRootSrvs ? graphicsRootSrvs[slot] : 0;
+          const D3D12_GPU_VIRTUAL_ADDRESS table =
+            graphicsDescriptorTables ? graphicsDescriptorTables[slot].ptr : 0;
+          log("ACZ root bind: index=%u srv=0x%llx table=0x%llx", slot,
+            static_cast<unsigned long long>(address),
+            static_cast<unsigned long long>(table));
+        }
       }
     }
     bool objectTransformFromSrv = false;
@@ -2660,26 +3359,13 @@ namespace remix {
     if (placementMode == AczPlacementMode::kScreenSpace) {
       static std::atomic<uint32_t> screenSpaceLogs { 0 };
       const uint32_t index = screenSpaceLogs.fetch_add(1, std::memory_order_relaxed);
-      if (index < 6) {
-        log("ACZ placement mode: vs=0x%016llx mode=screenSpace dropped indices=%u",
-          static_cast<unsigned long long>(nativePipelineInfo.vertexShaderHash),
-          indexCount);
-      }
+
       return;
     }
     // Address of the draw buffer the object matrix came from, so the leading
     // matrix at +0x000 can be read from the very same binding.
     D3D12_GPU_VIRTUAL_ADDRESS drawBufferAddress = 0;
     UINT64 drawBufferWidth = 0;
-    // The model record is bound through its own descriptor, so its address is
-    // resolved before the older candidates and reported once per session.
-    D3D12_GPU_VIRTUAL_ADDRESS modelRecordAddress = 0;
-    if (placementMode == AczPlacementMode::kBlendedMatrices && indexCount >= 20) {
-      logModelDescriptorSlots(graphicsDescriptorTables, count);
-      uint32_t recordSlot = 0;
-      if (findModelRecordDescriptor(graphicsDescriptorTables, modelRecordAddress, recordSlot))
-        logAczModelRecord(count, modelRecordAddress, recordSlot);
-    }
     if (graphicsRootSrvs) {
       for (uint32_t slot = 0; slot < 16 && !nativePipelineInfo.hasObjectToWorld; ++slot) {
         const D3D12_GPU_VIRTUAL_ADDRESS address = graphicsRootSrvs[slot];
@@ -2809,58 +3495,7 @@ namespace remix {
       }
       addCandidate(objectTransformCbv, 0x100000);
 
-      // The bound tables are scanned once per frame, because the views they hold
-      // outlive the individual draw while their base pointers do not.
-      {
-        static std::vector<D3D12_GPU_VIRTUAL_ADDRESS> cachedAddresses;
-        static std::vector<UINT64> cachedWidths;
-        static uint64_t cachedFrame = ~0ull;
-        if (drawFrame != cachedFrame) {
-          cachedFrame = drawFrame;
-          cachedAddresses.clear();
-          cachedWidths.clear();
-          collectDrawBufferCandidates(graphicsDescriptorTables, count,
-            cachedAddresses, cachedWidths);
-        }
-        for (size_t i = 0; i < cachedAddresses.size(); ++i)
-          addCandidate(cachedAddresses[i], cachedWidths[i]);
-      }
 
-      // Raw dump of the buffer the object matrix came from, so the layout around
-      // the leading matrix can be read off directly when decoding fails. One
-      // sample per frame spreads the dumps over the whole session instead of
-      // spending them on the first frame.
-      {
-        static std::atomic<uint32_t> blockDumps { 0 };
-        static uint64_t lastDumpFrame = ~0ull;
-        if (drawBufferAddress && drawFrame != lastDumpFrame
-         && blockDumps.fetch_add(1, std::memory_order_relaxed) < 10) {
-          lastDumpFrame = drawFrame;
-          log("ACZ identity draw: draw=%llu frame=%llu vs=0x%016llx ps=0x%016llx source=%u buffer=0x%llx width=%llu stride=%u indices=%u",
-            static_cast<unsigned long long>(count),
-            static_cast<unsigned long long>(drawFrame),
-            static_cast<unsigned long long>(nativePipelineInfo.vertexShaderHash),
-            static_cast<unsigned long long>(nativePipelineInfo.pixelShaderHash),
-            static_cast<unsigned>(nativePipelineInfo.objectTransformSource),
-            static_cast<unsigned long long>(drawBufferAddress),
-            static_cast<unsigned long long>(drawBufferWidth),
-            vertexBuffer.StrideInBytes, indexCount);
-          for (uint32_t row = 0; row < 24; ++row) {
-            std::vector<uint8_t> bytes;
-            if (!readGpuBuffer(drawBufferAddress + row * 16, 16, bytes)
-             || bytes.size() < 16) {
-              log("ACZ identity block +0x%03X: unreadable", row * 16);
-              continue;
-            }
-            const auto* words = reinterpret_cast<const uint32_t*>(bytes.data());
-            const auto* values = reinterpret_cast<const float*>(bytes.data());
-            log("ACZ identity block +0x%03X: %08x %08x %08x %08x | %12.5g %12.5g %12.5g %12.5g",
-              row * 16, words[0], words[1], words[2], words[3],
-              static_cast<double>(values[0]), static_cast<double>(values[1]),
-              static_cast<double>(values[2]), static_cast<double>(values[3]));
-          }
-        }
-      }
 
       // Model space vertices of this draw. A candidate matrix is only accepted
       // when it also puts them in front of the camera and near the screen, which
@@ -2980,13 +3615,7 @@ namespace remix {
         if (!haveCamera) {
           // Without a camera nothing can be validated, so the probe is skipped
           // instead of spending reads on candidates that cannot be accepted.
-          static std::atomic<uint32_t> noCameraLogs { 0 };
-          if (noCameraLogs.fetch_add(1, std::memory_order_relaxed) < 4) {
-            log("ACZ placement skipped: draw=%llu vs=0x%016llx indices=%u reason=no camera",
-              static_cast<unsigned long long>(count),
-              static_cast<unsigned long long>(nativePipelineInfo.vertexShaderHash),
-              indexCount);
-          }
+
           probeCount = 0;
         }
 
@@ -3018,7 +3647,6 @@ namespace remix {
           return distance > 1.0f && distance < 3000.0f;
         };
 
-        static std::atomic<uint32_t> probeLogs { 0 };
         for (uint32_t i = 0; i < probeCount && !fusedDecoded; ++i) {
           std::vector<uint8_t> block;
           if (!readGpuBuffer(probes[i], kProbeBytes, block) || block.size() < kProbeBytes)
@@ -3031,14 +3659,6 @@ namespace remix {
             if (blockLogs.fetch_add(1, std::memory_order_relaxed) < 12) {
               const auto* fused = reinterpret_cast<const float*>(block.data());
               const auto* object = reinterpret_cast<const float*>(block.data() + 0x100);
-              log("ACZ placement probe: draw=%llu probe=0x%llx vs=0x%016llx m0=(%.5g,%.5g,%.5g,%.5g) m4=(%.5g,%.5g,%.5g,%.5g)",
-                static_cast<unsigned long long>(count),
-                static_cast<unsigned long long>(probes[i]),
-                static_cast<unsigned long long>(nativePipelineInfo.vertexShaderHash),
-                static_cast<double>(fused[0]), static_cast<double>(fused[1]),
-                static_cast<double>(fused[2]), static_cast<double>(fused[3]),
-                static_cast<double>(object[0]), static_cast<double>(object[1]),
-                static_cast<double>(object[2]), static_cast<double>(object[3]));
             }
           }
 
@@ -3046,14 +3666,7 @@ namespace remix {
           std::array<float, 16> objectMatrix {};
           std::memcpy(objectMatrix.data(), block.data() + 0x100, sizeof(float) * 16);
           if (rigidPlacement(objectMatrix)) {
-            if (probeLogs.fetch_add(1, std::memory_order_relaxed) < 16) {
-              log("ACZ placement from object matrix: draw=%llu probe=0x%llx vs=0x%016llx t=(%.2f,%.2f,%.2f) indices=%u",
-                static_cast<unsigned long long>(count),
-                static_cast<unsigned long long>(probes[i]),
-                static_cast<unsigned long long>(nativePipelineInfo.vertexShaderHash),
-                static_cast<double>(objectMatrix[12]), static_cast<double>(objectMatrix[13]),
-                static_cast<double>(objectMatrix[14]), indexCount);
-            }
+
             nativePipelineInfo.objectToWorld = objectMatrix;
             nativePipelineInfo.hasObjectToWorld = true;
             nativePipelineInfo.objectTransformSource = 6;
@@ -3070,14 +3683,7 @@ namespace remix {
             continue;
           if (!rigidPlacement(decoded))
             continue;
-          if (probeLogs.fetch_add(1, std::memory_order_relaxed) < 16) {
-            log("ACZ placement from fused matrix: draw=%llu probe=0x%llx vs=0x%016llx t=(%.2f,%.2f,%.2f) indices=%u",
-              static_cast<unsigned long long>(count),
-              static_cast<unsigned long long>(probes[i]),
-              static_cast<unsigned long long>(nativePipelineInfo.vertexShaderHash),
-              static_cast<double>(decoded[12]), static_cast<double>(decoded[13]),
-              static_cast<double>(decoded[14]), indexCount);
-          }
+
           nativePipelineInfo.objectToWorld = decoded;
           nativePipelineInfo.hasObjectToWorld = true;
           nativePipelineInfo.objectTransformSource = 5;
@@ -3085,26 +3691,120 @@ namespace remix {
           fusedDecoded = true;
         }
 
-        static std::atomic<uint32_t> missLogs { 0 };
-        if (!fusedDecoded && missLogs.fetch_add(1, std::memory_order_relaxed) < 4) {
-          log("ACZ placement miss: draw=%llu vs=0x%016llx indices=%u probes=%u camera=%u",
-            static_cast<unsigned long long>(count),
-            static_cast<unsigned long long>(nativePipelineInfo.vertexShaderHash),
-            indexCount, probeCount, haveCamera ? 1u : 0u);
-        }
+
 
         // Periodic sample so the in-mission state is visible even after the first
         // few draws have spent the counters above. A draw counter is used rather
         // than the frame id because a frame id rarely lands on a model draw.
-        static std::atomic<uint32_t> windowLogs { 0 };
-        if (windowLogs.fetch_add(1, std::memory_order_relaxed) % 256 == 0) {
-          log("ACZ placement window: frame=%llu draw=%llu vs=0x%016llx indices=%u probes=%u camera=%u placed=%u",
-            static_cast<unsigned long long>(drawFrame),
-            static_cast<unsigned long long>(count),
-            static_cast<unsigned long long>(nativePipelineInfo.vertexShaderHash),
-            indexCount, probeCount, haveCamera ? 1u : 0u,
-            fusedDecoded ? 1u : 0u);
+
+      }
+    }
+    // The model extent is sampled once for the player and once for another
+    // aircraft. Equal extents mean the viewing distance is what is off, while a
+    // larger player model means the record carries a scale this layer drops.
+    {
+      const bool isAircraft = nativePipelineInfo.vertexShaderHash == 0xb6a7d1d096ce8fe7ull;
+      const bool zeroTranslation =
+        std::abs(nativePipelineInfo.objectToWorld[12]) < 1.0f
+        && std::abs(nativePipelineInfo.objectToWorld[13]) < 1.0f
+        && std::abs(nativePipelineInfo.objectToWorld[14]) < 1.0f;
+      static float measuredExtent[6] = {};
+      const bool wanted = isAircraft && zeroTranslation;
+      if (wanted && vertexBuffer.StrideInBytes) {
+        uint32_t positionOffset = 0;
+        for (const auto& element : nativePipelineInfo.inputElements) {
+          if (element.slot != 0)
+            continue;
+          std::string semantic = element.semantic;
+          std::transform(semantic.begin(), semantic.end(), semantic.begin(),
+            [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+          if (semantic == "POSITION") {
+            positionOffset = element.offset;
+            break;
+          }
         }
+        std::vector<uint8_t> bytes;
+        const size_t wanted = static_cast<size_t>(vertexBuffer.StrideInBytes) * 256;
+        if (readGpuBuffer(vertexBuffer.BufferLocation, wanted, bytes)) {
+          const uint32_t stride = vertexBuffer.StrideInBytes;
+          const uint32_t count = static_cast<uint32_t>(bytes.size() / stride);
+          float low[3] = { 1.0e30f, 1.0e30f, 1.0e30f };
+          float high[3] = { -1.0e30f, -1.0e30f, -1.0e30f };
+          for (uint32_t i = 0; i < count; ++i) {
+            const auto* point = reinterpret_cast<const float*>(
+              bytes.data() + static_cast<size_t>(i) * stride + positionOffset);
+            for (uint32_t axis = 0; axis < 3; ++axis) {
+              low[axis] = std::min(low[axis], point[axis]);
+              high[axis] = std::max(high[axis], point[axis]);
+            }
+          }
+          // Reported on change rather than once, because the question this answers
+          // is whether the vertex stream itself moves with the aircraft: a stream
+          // the game has already rotated and offset is drawn correctly with the
+          // camera position alone, while a static model space one is not.
+          const float measured[6] = {
+            low[0], low[1], low[2], high[0], high[1], high[2] };
+          bool changed = false;
+          for (uint32_t index = 0; index < 6; ++index)
+            changed = changed || measured[index] != measuredExtent[index];
+          if (changed) {
+            std::memcpy(measuredExtent, measured, sizeof(measured));
+            const auto* first = reinterpret_cast<const float*>(
+              bytes.data() + positionOffset);
+            log("ACZ model extent: idx=%u verts=%u stride=%u pos=%u min=(%.2f,%.2f,%.2f) max=(%.2f,%.2f,%.2f) v0=(%.2f,%.2f,%.2f)",
+              indexCount, count, stride, positionOffset,
+              static_cast<double>(low[0]), static_cast<double>(low[1]),
+              static_cast<double>(low[2]),
+              static_cast<double>(high[0]), static_cast<double>(high[1]),
+              static_cast<double>(high[2]),
+              static_cast<double>(first[0]), static_cast<double>(first[1]),
+              static_cast<double>(first[2]));
+          }
+        }
+      }
+    }
+    // The player aircraft is drawn with a record the game centres on the view, and this
+    // layer reconstructs its placement instead of reading it, so the draw is admitted on
+    // that record alone. Its object matrix cannot be the admission test: the matrix of a
+    // sub-mesh carries that sub-mesh's own offset, so requiring a zero translation there
+    // admitted only the parts that sit on the model origin, and the aircraft was drawn as
+    // the single piece those parts make up.
+    if (nativePipelineInfo.vertexShaderHash == 0xb6a7d1d096ce8fe7ull) {
+      // Only the first submission of a mesh is kept: the highlight pass repeats vertices
+      // that are already in the scene. A part drawn once and blended, such as glass or a
+      // decal, has no earlier submission and is still submitted.
+      if (nativePipelineInfo.blendEnabled
+       && placedMeshSubmitted(g_currentVertexBuffer, indexCount)) {
+        static std::unordered_set<uint64_t> loggedSkips;
+        const uint64_t skipKey = (static_cast<uint64_t>(g_currentVertexBuffer) << 8)
+          ^ static_cast<uint64_t>(indexCount);
+        if (loggedSkips.emplace(skipKey).second) {
+          log("ACZ aircraft skip: idx=%u vb=0x%llx", indexCount,
+            static_cast<unsigned long long>(g_currentVertexBuffer));
+        }
+        return;
+      }
+      // The camera the scene is rendered with takes priority: the vertex stream
+      // carries that camera's rotation, so undoing it needs the same matrix, not a
+      // block read at a different point in the frame.
+      AczCameraMatrices playerCamera {};
+      bool haveCamera = false;
+      float remixView[16] = {};
+      float remixEye[3] = {};
+      if (readD3D12CameraMatrices(remixView, remixEye)) {
+        std::memcpy(playerCamera.view.data(), remixView, sizeof(remixView));
+        for (uint32_t axis = 0; axis < 3; ++axis)
+          playerCamera.eye[axis] = remixEye[axis];
+        haveCamera = true;
+      } else {
+        haveCamera = buildAczCamera(playerCamera);
+      }
+      if (haveCamera
+       && placeAircraftInCameraFrame(playerCamera, nativePipelineInfo.objectToWorld,
+            nativePipelineInfo.objectTransformSource)) {
+        g_placedMeshes.emplace_back(g_currentVertexBuffer, indexCount);
+        nativePipelineInfo.hasObjectToWorld = true;
+        nativePipelineInfoPtr = &nativePipelineInfo;
       }
     }
     // The structured buffer the model shaders read their transform from is dumped
@@ -3116,15 +3816,8 @@ namespace remix {
       if (srtAddress && srtDumps.fetch_add(1, std::memory_order_relaxed) < 2) {
         std::vector<uint8_t> block;
         if (readGpuBuffer(srtAddress, 0x1A0, block) && block.size() >= 0x1A0) {
-          log("ACZ srt block: gpu=0x%llx elements=%u",
-            static_cast<unsigned long long>(srtAddress),
-            g_aczSrtBufferElements.load(std::memory_order_relaxed));
-          for (uint32_t row = 0; row < 26; ++row) {
+          for (uint32_t row = 16; row < 25; ++row) {
             const auto* v = reinterpret_cast<const float*>(block.data() + row * 16);
-            log("ACZ srt block +0x%03X: %13.4f %13.4f %13.4f %13.4f",
-              row * 16,
-              static_cast<double>(v[0]), static_cast<double>(v[1]),
-              static_cast<double>(v[2]), static_cast<double>(v[3]));
           }
         }
       }
@@ -3280,21 +3973,46 @@ namespace remix {
 
         static std::atomic<uint32_t> frameLogs { 0 };
         const uint32_t frameLog = frameLogs.fetch_add(1, std::memory_order_relaxed);
-        if (frameLog < 24) {
-          log("ACZ model camera frame: draw=%llu vs=0x%016llx source=%u chosen=%s stored=(%.2f,%.2f,%.2f) lifted=(%.1f,%.1f,%.1f) basis=(%.1f,%.1f,%.1f) eye=(%.1f,%.1f,%.1f) vertices=%u indices=%u",
-            static_cast<unsigned long long>(count),
-            static_cast<unsigned long long>(shaderHash),
-            static_cast<unsigned>(source),
-            chosen < 3 ? kConventionNames[chosen] : "none",
-            static_cast<double>(stored[12]), static_cast<double>(stored[13]),
-            static_cast<double>(stored[14]),
-            static_cast<double>(placements[1][12]), static_cast<double>(placements[1][13]),
-            static_cast<double>(placements[1][14]),
-            static_cast<double>(placements[2][12]), static_cast<double>(placements[2][13]),
-            static_cast<double>(placements[2][14]),
-            static_cast<double>(camera.eye[0]), static_cast<double>(camera.eye[1]),
-            static_cast<double>(camera.eye[2]),
-            vertexCount, indexCount);
+
+      }
+    }
+    // Only the draws this task can act on are reported: one that sits next to the
+    // camera, which is where the player aircraft belongs, and one whose transform
+    // collapsed to the origin while it is large enough to be a hull. Both are
+    // reported on every frame, so a moving aircraft is never missed.
+    if (indexCount >= 200) {
+      const auto& meshMatrix = nativePipelineInfoPtr->objectToWorld;
+      const bool hasTransform = nativePipelineInfoPtr->hasObjectToWorld;
+      AczCameraMatrices meshCamera {};
+      float eyeDistance = 0.0f;
+      const bool haveCamera = buildAczCamera(meshCamera);
+      if (haveCamera) {
+        const float dx = meshMatrix[12] - meshCamera.eye[0];
+        const float dy = meshMatrix[13] - meshCamera.eye[1];
+        const float dz = meshMatrix[14] - meshCamera.eye[2];
+        eyeDistance = std::sqrt(dx * dx + dy * dy + dz * dz);
+      }
+      const bool nearCamera = haveCamera && eyeDistance < 200.0f;
+      const bool collapsedAtOrigin = hasTransform && indexCount >= 500
+        && std::abs(meshMatrix[12]) < 1.0e-3f
+        && std::abs(meshMatrix[13]) < 1.0e-3f
+        && std::abs(meshMatrix[14]) < 1.0e-3f;
+      // Once the player aircraft is placed in the camera frame every one of its
+      // draws lands within the near window, so the report is keyed by what the draw
+      // actually is rather than repeated per frame.
+      if (nearCamera || collapsedAtOrigin) {
+        static std::unordered_set<uint64_t> reportedMeshes;
+        const uint64_t meshKey = (static_cast<uint64_t>(indexCount) << 8)
+          | (static_cast<uint64_t>(nativePipelineInfo.objectTransformSource) << 1)
+          | (nearCamera ? 1ull : 0ull);
+        if (reportedMeshes.size() >= 256 || reportedMeshes.insert(meshKey).second) {
+          log("ACZ mesh: vs=0x%016llx ps=0x%016llx idx=%u t=(%.1f,%.1f,%.1f) hasT=%d eyeDist=%.1f",
+            static_cast<unsigned long long>(nativePipelineInfo.vertexShaderHash),
+            static_cast<unsigned long long>(nativePipelineInfo.pixelShaderHash),
+            indexCount,
+            static_cast<double>(meshMatrix[12]), static_cast<double>(meshMatrix[13]),
+            static_cast<double>(meshMatrix[14]),
+            hasTransform ? 1 : 0, static_cast<double>(eyeDistance));
         }
       }
     }
@@ -3419,6 +4137,16 @@ namespace remix {
       ID3D12Resource* backBuffer,
       const D3D12_RESOURCE_DESC* backBufferDescription) {
     initializeD3D12RuntimeAdapter();
+    // The position this frame renders is the engine target the previous frame ended with.
+    // Advancing it here keeps every submission of a frame on one value and still moves the
+    // aircraft forward once per frame, including while the target itself stands still.
+    if (g_targetSeenValid) {
+      for (uint32_t index = 0; index < 3; ++index)
+        g_cachedTarget[index] = g_targetSeen[index];
+      g_cachedTargetValid = true;
+    }
+
+    g_placedMeshes.clear();
     const uint64_t frame = g_presentCount.load(std::memory_order_relaxed) + 1;
     {
       std::lock_guard lock(g_frameMutex);
@@ -3431,66 +4159,9 @@ namespace remix {
       static_cast<unsigned long long>(frame), swapChain, backBufferIndex, backBuffer);
   }
 
-  // Content-based camera search. The draw buffer that carries the camera can be
-  // bound through a root-signature range the command-list trace cannot map, so
-  // instead of guessing bindings this walks the tracked buffer SRVs and accepts
-  // the first one whose leading 64 bytes form a row-vector view-projection.
-  void scanTrackedBuffersForCamera() {
-    static std::atomic<uint32_t> scans { 0 };
-    if (scans.fetch_add(1, std::memory_order_relaxed) > 8)
-      return;
-
-    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> candidates;
-    std::vector<UINT64> widths;
-    {
-      std::lock_guard lock(g_frameMutex);
-      for (const auto& entry : g_descriptors) {
-        const DescriptorMetadata& metadata = entry.second;
-        if (!metadata.viewType || std::strcmp(metadata.viewType, "SRV") != 0)
-          continue;
-        if (metadata.resourceDescription.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
-          continue;
-        if (!metadata.resourceGpuAddress)
-          continue;
-
-        UINT64 elementOffset = 0;
-        if (metadata.viewDescriptionSize >= sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC)) {
-          const auto* srv = reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(
-            metadata.viewDescription.data());
-          if (srv->ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
-            elementOffset = static_cast<UINT64>(srv->Buffer.FirstElement)
-              * srv->Buffer.StructureByteStride;
-          }
-        }
-        const UINT64 width = metadata.resourceDescription.Width > elementOffset
-          ? metadata.resourceDescription.Width - elementOffset : 0;
-        candidates.push_back(metadata.resourceGpuAddress + elementOffset);
-        widths.push_back(width);
-        if (candidates.size() >= 2048)
-          break;
-      }
-    }
-
-    log("D3D12 camera scan: tracked buffers=%zu", candidates.size());
-    for (size_t i = 0; i < candidates.size(); ++i) {
-      std::array<float, 16> matrix {};
-      if (!readMatrixFromShaderBuffer(candidates[i], widths[i], 0, matrix))
-        continue;
-      if (!isCameraViewProjection(matrix))
-        continue;
-      log("D3D12 camera scan hit: gpu=0x%llx width=%llu",
-        static_cast<unsigned long long>(candidates[i]),
-        static_cast<unsigned long long>(widths[i]));
-      submitD3D12Camera(matrix.data(), nullptr);
-      return;
-    }
-  }
 
   void recordD3D12Present(void* swapChain, UINT syncInterval, UINT flags, HRESULT result) {
-    pollCameraConventionKeys();
     initializeD3D12RuntimeAdapter();
-    scanTrackedBuffersForCamera();
-
     // The camera is rebuilt from the game's own block every frame. Remix only
     // reports a camera as valid on the frame it was updated, so a frame without a
     // readable block keeps the last submitted matrices.
@@ -3504,18 +4175,6 @@ namespace remix {
 
           if (fitLogs < 4) {
             ++fitLogs;
-            log("ACZ camera fit: center=(%.1f,%.1f,%.1f) radius=%.1f near=%.3f far=%.1f eye=(%.1f,%.1f,%.1f) third=(%.3f,%.3f,%.3f) depth=%s vertical=%s fovY=%.2f",
-              static_cast<double>(centerX), static_cast<double>(centerY),
-              static_cast<double>(centerZ), static_cast<double>(radius),
-              static_cast<double>(camera.nearPlane), static_cast<double>(camera.farPlane),
-              static_cast<double>(camera.eye[0]), static_cast<double>(camera.eye[1]),
-              static_cast<double>(camera.eye[2]),
-              static_cast<double>(camera.third[0]), static_cast<double>(camera.third[1]),
-              static_cast<double>(camera.third[2]),
-              camera.depthSign < 0.0f ? "backward" : "forward",
-              camera.verticalSign > 0.0f ? "positive" : "negative",
-              static_cast<double>(2.0 * std::atan(1.0 / camera.p11)
-                * 180.0 / 3.14159265358979));
 
             // Reading the block's rows as right, up, third only holds when the
             // three vectors are orthonormal and r x u reproduces the third row.
@@ -3528,25 +4187,11 @@ namespace remix {
             const float crossX = ry * uz - rz * uy;
             const float crossY = rz * ux - rx * uz;
             const float crossZ = rx * uy - ry * ux;
-            log("ACZ camera basis: |r|=%.4f |u|=%.4f |f|=%.4f r.u=%.4f r.f=%.4f u.f=%.4f rxu.f=%.4f",
-              static_cast<double>(std::sqrt(rx * rx + ry * ry + rz * rz)),
-              static_cast<double>(std::sqrt(ux * ux + uy * uy + uz * uz)),
-              static_cast<double>(std::sqrt(
-                camera.third[0] * camera.third[0] + camera.third[1] * camera.third[1]
-                + camera.third[2] * camera.third[2])),
-              static_cast<double>(rx * ux + ry * uy + rz * uz),
-              static_cast<double>(rx * camera.third[0] + ry * camera.third[1]
-                + rz * camera.third[2]),
-              static_cast<double>(ux * camera.third[0] + uy * camera.third[1]
-                + uz * camera.third[2]),
-              static_cast<double>(crossX * camera.third[0] + crossY * camera.third[1]
-                + crossZ * camera.third[2]));
           }
         } else {
           static uint32_t missingBlockLogs = 0;
           if (missingBlockLogs < 2) {
             ++missingBlockLogs;
-            log("ACZ camera: block unavailable, keeping the last submitted camera");
           }
         }
       }
@@ -3561,22 +4206,7 @@ namespace remix {
         AczCameraProbe probe;
         if (readAczCameraProbe(probe)) {
           ++dumps;
-          log("ACZ transform args: ctx=0x%llx out=0x%llx in=0x%llx count=%llu",
-            static_cast<unsigned long long>(probe.transformArgs[0]),
-            static_cast<unsigned long long>(probe.transformArgs[1]),
-            static_cast<unsigned long long>(probe.transformArgs[2]),
-            static_cast<unsigned long long>(probe.transformArgs[3]));
-          log("ACZ camera probe: samples=%u object=0x%llx inner=0x%llx camera=0x%llx",
-            probe.samples,
-            static_cast<unsigned long long>(probe.object),
-            static_cast<unsigned long long>(probe.inner),
-            static_cast<unsigned long long>(probe.camera));
           for (uint32_t row = 0; row < 8; ++row) {
-            log("ACZ camera block r%u: %12.3f %12.3f %12.3f %12.6f", row,
-              static_cast<double>(probe.block[row * 4 + 0]),
-              static_cast<double>(probe.block[row * 4 + 1]),
-              static_cast<double>(probe.block[row * 4 + 2]),
-              static_cast<double>(probe.block[row * 4 + 3]));
           }
         }
       }
